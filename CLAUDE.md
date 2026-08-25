@@ -19,6 +19,7 @@ Kiro-style Spec-Driven Development on an agentic SDLC
 
 ## Development Guidelines
 - Think in English, generate responses in Japanese. All Markdown content written to project files (e.g., requirements.md, design.md, tasks.md, research.md, validation reports) MUST be written in the target language configured for this specification (see spec.json.language).
+- **Go implementation MUST use the `modern-go-guidelines` plugin** (marketplace: `goland-claude-marketplace`, declared in `.claude/settings.json`). Whenever writing or modifying Go code (`.go` files, `go.mod`), ALWAYS invoke the plugin's `use-modern-go` skill first so generated code uses modern Go features matching the `go.mod` version. This applies to implementer subagents as well. If the plugin is not installed in the current environment, install it first: `claude plugin marketplace add JetBrains/go-modern-guidelines && claude plugin install modern-go-guidelines@goland-claude-marketplace`.
 
 ## Minimal Workflow
 - Phase 0 (optional): `/kiro-steering`, `/kiro-steering-custom`
