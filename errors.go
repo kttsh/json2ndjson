@@ -38,7 +38,9 @@ var _ error = (*ExitError)(nil)
 
 // Error は原因エラーのメッセージをそのまま返す。
 // stderr には人間向けメッセージのみを書く規律(要件 8.2、FR-41)のため、
-// 終了コードの数値をメッセージへ混ぜない。
+// 原因エラーがあるかぎり終了コードの数値をメッセージへ混ぜない。
+// 例外は原因エラーが nil の縮退ケースで、error 契約上メッセージを空文字列に
+// できないため、終了コードを含む既定の文言を返す。
 func (e *ExitError) Error() string {
 	if e.Err == nil {
 		return fmt.Sprintf("終了コード %d の異常終了", e.Code)

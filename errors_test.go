@@ -128,12 +128,3 @@ func TestExitErrorAsNotFound(t *testing.T) {
 		t.Error("errors.As が *ExitError 以外から取り出しに成功した")
 	}
 }
-
-// TestExitErrorImplementsError は *ExitError が error インターフェースを
-// 満たすことを検証する。
-func TestExitErrorImplementsError(t *testing.T) {
-	var err error = &ExitError{Code: ExitUsage, Err: errors.New("x")}
-	if err == nil {
-		t.Fatal("*ExitError が error として扱えない")
-	}
-}
