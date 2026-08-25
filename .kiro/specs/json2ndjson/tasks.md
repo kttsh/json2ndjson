@@ -1,6 +1,6 @@
 # Implementation Plan
 
-- [ ] 1. Go モジュールと実行基盤の整備
+- [x] 1. Go モジュールと実行基盤の整備
   - リポジトリ直下に main パッケージを置き、モジュールパス末尾が json2ndjson になる go.mod を作成し、go/toolchain ディレクティブで Go 1.27 系を固定する。ファイルロック用の公式拡張モジュールを唯一の依存として追加する
   - 終了コード体系(0〜5, 9)の定数と、終了コードを保持するエラー型を定義し、全コンポーネントが共有できるようにする
   - 全コンポーネントが参照する検証済み設定構造体(Config)の骨格を design.md の契約どおり定義する(値の解析・検証は 4.1 の責務)
@@ -106,3 +106,13 @@
   - _Requirements: 11.1, 7.5_
   - _Boundary: build_
   - _Depends: 5.1_
+
+## Implementation Notes
+
+- **Go 1.27 は本環境で取得できない**(タスク 1)。ツールチェーンの配布元(`storage.googleapis.com`)と代替 module proxy がいずれも組織のエグレスポリシーで 403。`sum.golang.org` も同様のため `GOSUMDB=off` が必要。再試行しないこと。
+- **代替ツールチェーン**: `go` は Go 1.25.1(`/usr/local/go1.25.1`)。`go env -w` で `GOEXPERIMENT=jsonv2` / `GOSUMDB=off` / `GOTOOLCHAIN=local` を設定済み。`encoding/json/jsontext` は design.md が要求する API(`ReadValue`・`ReadToken`・`StackDepth`・`Value.Compact`・`AllowInvalidUTF8`・`AllowDuplicateNames`・`PreserveRawStrings`)を同一 import パスで提供し、数値字句と UTF-8 サロゲートの保持も実測確認済み。
+- **go.mod の逸脱**: design.md の「Go 1.27 系を固定」に対し `go 1.25.1` のみを宣言し `toolchain` ディレクティブを置かない。`go` ディレクティブは下限指定のため無改変で Go 1.27 でもビルドできる(1.27 では GOEXPERIMENT 不要)。タスク 6.2 で Go 1.27 が使える環境なら design.md どおりに戻す判断が必要。
+- **`golang.org/x/sys` の require はタスク 3.1 で追加する**(タスク 1)。import するソース(`lock_windows.go`)が存在しない状態で require を書くと `go mod tidy` が即座に除去して go.mod を書き換えるため。v0.47.0 はローカル module cache に取得済み。
+- **`staticcheck` は `/root/go/bin/staticcheck`(2026.1 / v0.7.0)**。最新版は Go 1.26 以上を要求するため v0.7.0 を採用。`staticcheck ./...` を正準検証コマンドに含めること(タスク 1 では SA4023 の自己証明的テストを検出した)。
+- **`go build ./...` はリポジトリ直下に実行ファイル `json2ndjson` を生成する**。`.gitignore` に登録済み。
+- **正準検証コマンド**: `gofmt -l .`(出力空)/ `go vet ./...` / `/root/go/bin/staticcheck ./...` / `go test ./...` / `go build ./...` / `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o <out>.exe .`
