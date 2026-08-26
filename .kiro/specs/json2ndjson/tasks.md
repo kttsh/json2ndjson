@@ -44,7 +44,7 @@
   - _Boundary: lock_
   - _Depends: 1_
 
-- [ ] 3.2 出力ファイル管理: 新規作成モード
+- [x] 3.2 出力ファイル管理: 新規作成モード
   - 出力と同一ディレクトリに決定的な名前の一時ファイルを排他的に作成・ロックし(未ロックの残骸は stale として削除)、全件書き込み後に rename で出力パスへ置換する。失敗時は一時ファイルを削除して出力パスに触れない
   - 既存出力があり上書き指定がない場合は書き込み開始前に終了コード 4 で停止する。レコード 0 件でも 0 バイトのファイルを作成する
   - 改行コード(LF/CRLF)と最終行改行の設定を適用し、BOM なし UTF-8 で書き出す
@@ -127,6 +127,7 @@
   - 注意: `warn` に**型付き nil**(例 `var w *bytes.Buffer` を `io.Writer` として渡す)を与え、かつ実際に超過レコードが存在すると `transform.go` の `fmt.Fprintf` で panic する。5.1 が渡すのは `os.Stderr`(非 nil 具象値)なので到達経路はない。
 - **タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**(要件 9.4 / NFR-05、タスク 2.2)。未配線でもコンパイル・静的解析・テストのいずれも失敗しない(Go では未使用の定数はエラーにならず、テストが参照しているため未使用検出にもかからない)。4.1 に「`--help` 出力が `dedupeMemoryNote` を含むこと」を検証するテストを課すこと。あわせて「`--dedupe-key` の指定位置が存在しないレコードは重複排除の対象外として常に出力される」旨もヘルプに 1 行記載することが望ましい。
 - ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
+- **タスク 3.3 は `output_test.go` の `TestOpenOutputAppendModeIsNotWiredYet` を、追記モードの本来のテストへ置き換えること**(タスク 3.2)。これは追記の継ぎ目が未実装であることを固定する「見張り番」テストで、3.3 が追記を実装した時点で失敗する(それが意図)。現状この指示は `output_test.go` のコメントにしかなく、3.3 の担当者が先に読む保証がないためここに記録する。なお未結線の継ぎ目は終了コード **9(`ExitInternal`)** を返す設計とした(4 を返すと未実装経路が「環境側の失敗=リトライ・調査対象」を装い、呼び出し元の切り分けを誤らせるため)。
 - **タスク 3.3 は追記モードの出力ファイルを `os.O_RDWR|os.O_APPEND|os.O_CREATE` で開くこと。`os.O_WRONLY|os.O_APPEND` は Windows 実機でのみ排他が壊れる**(タスク 3.1 のレビューで発見、コントローラが Go のソースで裏取り済み)。理由: `syscall.Open`(`/usr/local/go1.25.1/src/syscall/syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `access &^= GENERIC_WRITE` を行う。`O_WRONLY|O_APPEND|O_CREATE` では GENERIC_READ も GENERIC_WRITE も残らず、`LockFileEx` が要求する「GENERIC_READ または GENERIC_WRITE で開かれたハンドル」を満たさないため `tryLock` が `ERROR_ACCESS_DENIED` を返す。この値は `ErrLocked` へ写像されず `default:` 分岐で素通しされるので、**要件 4.6 の排他が無言で機能しなくなる**。`O_RDWR|O_APPEND` なら GENERIC_READ が残り成立する(末尾 1 バイトを読む必要からも読み取り権限は必要)。Linux では no-op のため**コンパイル・静的解析・テストのいずれでも検出できない**。
 - **タスク 3.2 / 3.3 は Linux 上で「同時実行 → 終了コード 4」を検証できない**(タスク 3.1)。非 Windows の `tryLock` は no-op で、同一パスの 2 本のハンドルが両方ロックに成功する(`TestTryLockIsNoOpOnNonWindows` が明示的に固定)。design.md の `output_test.go` 行と「Validation: 同時実行」はこの環境では充足不能。排他テストは `runtime.GOOS != "windows"` で Skip するか Windows 受け入れテストへ委譲し、**3.2/3.3 は「要件 4.6 を検証済み」と主張してはならない**。
 - **タスク 3.2 / 3.3 は `RecordSink.WriteRecord` が受け取る `compact` を呼び出しを越えて保持してはならない**(タスク 2.3)。convert はレコードバッファを再利用するため、呼び出し後に内容が書き換わる(実測確認済み)。`bufio.Writer` へ即時に書き出す実装なら制約に抵触しない。保持する必要がある実装は自分で写しを取ること。この寿命契約は design.md には無く、`convert.go` の `RecordSink` インターフェースの doc コメントに記載されている。
@@ -141,7 +142,19 @@
 - Windows 実装は `LockFileEx` を `LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY` で呼ぶ非ブロッキング。競合を示す `ERROR_LOCK_VIOLATION` / `ERROR_IO_PENDING` のみを `ErrLocked` に写像し、他は素通しする。
 - **`lock_windows.go` の意味論は機械的検証が一切効かない**。範囲不一致・`LOCKFILE_FAIL_IMMEDIATELY` の除去・`reserved=1` のいずれも Linux テスト・`GOOS=windows go vet`・`GOOS=windows staticcheck` をすべて通過することが実測されている。編集する場合は x/sys 実ソース・MSDN・Go ツールチェーン自身の `cmd/go/internal/lockedfile/internal/filelock/filelock_windows.go` との読み合わせが必須。
 
+### タスク 3.2 が確定した output の契約(新規作成モード)
+
+- `openOutput(cfg) (*OutputManager, error)` / `WriteRecord` / `Finalize` / `Abort`。エラーは終了コード **4**(`ExitOutput`)にパス付きで写像する。
+- **`Finalize` の順序は `Flush→Sync→unlock→Close→rename`**(design.md の「Flush→Sync→rename→unlock」からの意図的な逸脱)。Windows の `os.OpenFile` は共有モードに `FILE_SHARE_DELETE` を含めず(`syscall_windows.go:395` で確認)、`os.Rename` は `MoveFileEx` なので、ハンドルを開いたままの rename は `ERROR_SHARING_VIOLATION` で失敗する。また `Close` 自体がロックを解放するため unlock を Close の後に置けない。**design.md どおりの順序は Windows で実現不能。**
+- **`Abort` は出力パスを削除しない**(design.md の Postconditions「新規: 不在」からの意図的な逸脱)。出典 `docs/requirements.md` の FR-39 は「FR-21 または FR-23 の状態に戻す」と定め、FR-21 は「失敗時に中途半端なファイルを残さない」であって「存在しない状態」を要求していない。`--overwrite` の置換中に中断したとき出力パスを削除すると実行前のユーザーデータを失い、かえって FR-21 に反する。`Abort` は一時ファイルの削除のみを行う。
+- `Finalize` 成功後に `main` の defer が `Abort` を呼ぶ経路で確定済みの出力を消さないよう、状態でガードしている。
+- `Config.Newline` がゼロ値のときは既定の LF(要件 3.3)へ正規化する。値域の検証自体はタスク 4.1 の責務。
+
 ### 未解決の所見(ブロッキングではない)
+
+- **`file.Sync()` のエラーを無視する変異がテストで検出されない**(タスク 3.2)。0 件経路では `bufio.Writer.Flush` が nil を返し、続く `Sync` と `Close` がともに同じエラーを返すため、Sync 検査の除去が観測できない構造的な理由による。検出には `*os.File` をインターフェース化する必要があり、耐久性のみに影響する検査のために本番経路を劣化させる判断として見送った。
+- **壊れたシンボリックリンクを「存在する」と扱う `Lstat` の採用根拠を固定するテストがない**(タスク 3.2)。`Stat` への変異が生存する。
+- **テスト表に「CRLF・最終行改行なし・0 件」の 1 マスが欠けている**(タスク 3.2)。レビュー側のハーネスで補完し PASS を確認済み。
 
 - **design.md「File Structure Plan」が `lock.go` / `lock_test.go` を列挙していない**(タスク 3.1)。`_Boundary: lock_` は両ファイルを許可しているため逸脱ではないが、design.md 側が軽微に陳腐化している。
 
