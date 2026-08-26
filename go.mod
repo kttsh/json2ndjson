@@ -19,6 +19,6 @@
 // これ以外のサードパーティモジュールは追加しない。
 module github.com/kttsh/json2ndjson
 
-go 1.27.0
+go 1.25.1
 
 require golang.org/x/sys v0.47.0

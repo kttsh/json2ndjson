@@ -6,7 +6,7 @@
 
 ## Core Technologies
 
-- **Language**: Go 1.27 系最新パッチ(2026-08 時点で 1.27.0)。`go.mod` の `go` ディレクティブでパッチまで固定し、`GOTOOLCHAIN=auto` で同一ツールチェーンを自動取得させる(IMPL-01)
+- **Language**: Go 1.27 系を配布ビルドの正とする(IMPL-01)。ただし `go.mod` の `go` ディレクティブは下限 1.25.1 を宣言する。開発コンテナのエグレスポリシーが 1.27 ツールチェーンの取得を遮断しており(2026-08-26 実測: proxy.golang.org / dl.google.com / go.dev すべて 403)、1.27 を要求すると開発環境でビルド不能になるため。Go 1.25.x では `GOEXPERIMENT=jsonv2` が必要
 - **JSON 処理**: 標準ライブラリ `encoding/json/jsontext`(Go 1.27 で既定有効。GOEXPERIMENT 不要)
 - **依存方針**: 標準ライブラリのみ。唯一の例外は Windows ファイルロック(`LockFileEx`)用の `golang.org/x/sys`(IMPL-02)。これ以外のサードパーティモジュールは追加しない
 
