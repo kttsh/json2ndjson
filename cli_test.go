@@ -570,6 +570,16 @@ func TestParseArgsUsageErrors(t *testing.T) {
 			wantMsgs: []string{"--dedupe-key"},
 		},
 		{
+			name:     "--cursor-key に空の JSON Pointer(--path の \"\" とは非対称)",
+			args:     []string{"--in", "/in/a.json", "--out", "/out/o.ndjson", "--cursor-key", ""},
+			wantMsgs: []string{"--cursor-key", "空の JSON Pointer", "省略"},
+		},
+		{
+			name:     "--dedupe-key に空の JSON Pointer(--path の \"\" とは非対称)",
+			args:     []string{"--in", "/in/a.json", "--out", "/out/o.ndjson", "--dedupe-key", ""},
+			wantMsgs: []string{"--dedupe-key", "空の JSON Pointer", "省略"},
+		},
+		{
 			name:     "--add-field に = がない",
 			args:     []string{"--in", "/in/a.json", "--out", "/out/o.ndjson", "--add-field", "novalue"},
 			wantMsgs: []string{"--add-field", "novalue"},
@@ -635,6 +645,77 @@ func TestParseArgsUsageErrors(t *testing.T) {
 				if !strings.Contains(msg, want) {
 					t.Errorf("エラーメッセージに %q が含まれていません: %s", want, msg)
 				}
+			}
+			if !containsJapanese(msg) {
+				t.Errorf("エラーメッセージが日本語を含んでいません(要件 8.2): %s", msg)
+			}
+		})
+	}
+}
+
+// TestParseArgsEmptyPointerArgs は「空文字列の JSON Pointer」に対する 3 者の非対称性を固定する
+// (要件 2.1 / 5.4 / 6.1 / 7.3)。RFC 6901 では "" もルートを指す有効な値であるため、
+// 引数ごとの扱いの違いは明示的に主張しておかないと、後の変更で黙って反転しうる。
+//
+//   - --path "" はルート指定として有効(既定と同じ)。TestParseArgsValidMatrix でも固定している
+//   - --cursor-key "" / --dedupe-key "" は引数不正(終了コード 1)。ルートを指すカーソルや
+//     重複排除キーは意味を持たない一方、これを「未指定」と読み替えると、スクリプトが
+//     未設定の変数を展開して --cursor-key "" を渡した場合に黙って「カーソルなし」となり、
+//     結果行では要件 5.4 の「0 件だから last_id なし」と区別できなくなる
+//   - CursorKey / DedupeKey が nil(未指定)になるのは、引数ごと省略した場合だけ
+func TestParseArgsEmptyPointerArgs(t *testing.T) {
+	t.Run("--path の空文字列はルートとして受け付ける", func(t *testing.T) {
+		args := []string{"--in", "/in/a.json", "--out", "/out/o.ndjson", "--path", ""}
+		cfg, err := parseArgs(args)
+		if err != nil {
+			t.Fatalf("parseArgs(%q) = エラー %v, want 成功(要件 2.1: \"\" はルート)", args, err)
+		}
+		if len(cfg.Path) != 0 {
+			t.Errorf("Path = %v, want ルート(長さ 0)", cfg.Path)
+		}
+	})
+
+	t.Run("引数ごと省略した場合だけが未指定(nil)になる", func(t *testing.T) {
+		args := []string{"--in", "/in/a.json", "--out", "/out/o.ndjson"}
+		cfg, err := parseArgs(args)
+		if err != nil {
+			t.Fatalf("parseArgs(%q) = エラー %v, want 成功", args, err)
+		}
+		if cfg.CursorKey != nil {
+			t.Errorf("CursorKey = %v, want nil(省略時は未指定)", cfg.CursorKey)
+		}
+		if cfg.DedupeKey != nil {
+			t.Errorf("DedupeKey = %v, want nil(省略時は未指定)", cfg.DedupeKey)
+		}
+	})
+
+	rejected := []struct {
+		name string
+		flag string
+	}{
+		{"--cursor-key の空文字列は引数不正(未指定として黙認しない)", "--cursor-key"},
+		{"--dedupe-key の空文字列は引数不正(未指定として黙認しない)", "--dedupe-key"},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			args := []string{"--in", "/in/a.json", "--out", "/out/o.ndjson", tt.flag, ""}
+			cfg, err := parseArgs(args)
+			if err == nil {
+				t.Fatalf("parseArgs(%q) = %+v, want エラー(空の JSON Pointer は拒否する)", args, cfg)
+			}
+			if cfg != nil {
+				t.Errorf("parseArgs(%q) はエラー時に Config を返してはいけません: %+v", args, cfg)
+			}
+			var exitErr *ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("parseArgs(%q) のエラー %v は *ExitError ではありません", args, err)
+			}
+			if exitErr.Code != ExitUsage {
+				t.Errorf("終了コード = %d, want %d(要件 7.3)", exitErr.Code, ExitUsage)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, tt.flag) {
+				t.Errorf("エラーメッセージに引数名 %q が含まれていません(要件 8.2): %s", tt.flag, msg)
 			}
 			if !containsJapanese(msg) {
 				t.Errorf("エラーメッセージが日本語を含んでいません(要件 8.2): %s", msg)
@@ -864,6 +945,42 @@ func TestUsageTextDocumentsDedupeMissingPosition(t *testing.T) {
 		if !strings.Contains(usage, want) {
 			t.Errorf("--help に --dedupe-key の位置が存在しないレコードの扱いの記載(%q)がありません", want)
 		}
+	}
+}
+
+// usageFlagSection は --help の出力から引数 name の説明ブロック(次の引数の直前まで)を切り出す。
+// 引数の項目は 2 個分、説明本文は 8 個分の空白で字下げされているため、"\n  --" で区切れる。
+func usageFlagSection(t *testing.T, usage, name string) string {
+	t.Helper()
+	const indent = "\n  "
+	start := strings.Index(usage, indent+name+" ")
+	if start < 0 {
+		t.Fatalf("--help に %s の項目が見つかりません", name)
+	}
+	rest := usage[start+len(indent):]
+	if end := strings.Index(rest, indent+"--"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
+}
+
+// TestUsageTextDocumentsEmptyPointerRejection は --cursor-key / --dedupe-key に空の
+// JSON Pointer を指定できないこと、および省略が未指定の指定方法であることの記載を検証する。
+//
+// 本ツールはログファイルを持たない(要件 11.2 / NFR-10)ためヘルプが運用者の唯一の文書であり、
+// --path では "" がルートを意味する(要件 2.1)のと非対称である以上、
+// ヘルプに書かれていなければ運用者は取り違える。
+func TestUsageTextDocumentsEmptyPointerRejection(t *testing.T) {
+	usage := usageText()
+	for _, name := range []string{"--cursor-key", "--dedupe-key"} {
+		t.Run(name, func(t *testing.T) {
+			section := usageFlagSection(t, usage, name)
+			for _, want := range []string{"空の JSON Pointer", "省略", "--path"} {
+				if !strings.Contains(section, want) {
+					t.Errorf("--help の %s の項目に %q の記載がありません:\n%s", name, want, section)
+				}
+			}
+		})
 	}
 }
 

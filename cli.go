@@ -191,17 +191,25 @@ func parseArgs(args []string) (*Config, error) {
 			*newline, newlineLF, newlineCRLF)
 	}
 
+	// 明示的に指定された引数の集合。既定値と同じ値が明示指定されうる引数
+	// (--max-record-bytes の 0、--cursor-key / --dedupe-key の空文字列)は、
+	// 値だけを見ても「指定された」のか「既定のまま」なのかを判別できないため Visit で見る。
+	specified := make(map[string]bool, fs.NFlag())
+	fs.Visit(func(f *flag.Flag) {
+		specified[f.Name] = true
+	})
+
 	// JSON Pointer の構文(要件 2.1)。ParsePointer は素の error を返すため、
 	// 引数名を添えて終了コード 1 へ写像するのが cli の責務(design.md「Error Handling」)。
 	path, err := parsePointerArg("--path", *pathStr)
 	if err != nil {
 		return nil, err
 	}
-	cursorPtr, err := optionalPointerArg("--cursor-key", *cursorKey)
+	cursorPtr, err := optionalPointerArg("--cursor-key", *cursorKey, specified["cursor-key"])
 	if err != nil {
 		return nil, err
 	}
-	dedupePtr, err := optionalPointerArg("--dedupe-key", *dedupeKey)
+	dedupePtr, err := optionalPointerArg("--dedupe-key", *dedupeKey, specified["dedupe-key"])
 	if err != nil {
 		return nil, err
 	}
@@ -213,14 +221,8 @@ func parseArgs(args []string) (*Config, error) {
 
 	// レコード上限は正の整数のみ。0 は Config 上「無制限」を意味する内部表現であり、
 	// 明示指定は意図の取り違え(無制限のつもりか 0 バイト上限のつもりか)を招くため拒否する。
-	// 「指定されたか」は既定値との比較では判定できない(0 が既定値のため)ので Visit で見る。
-	maxRecordBytesSet := false
-	fs.Visit(func(f *flag.Flag) {
-		if f.Name == "max-record-bytes" {
-			maxRecordBytesSet = true
-		}
-	})
-	if maxRecordBytesSet && *maxRecordBytes <= 0 {
+	// 「指定されたか」は既定値との比較では判定できない(0 が既定値のため)ので specified で見る。
+	if specified["max-record-bytes"] && *maxRecordBytes <= 0 {
 		return nil, usageErrorf("--max-record-bytes には正の整数を指定してください(指定値: %d)", *maxRecordBytes)
 	}
 	// --skip-oversize は上限の指定があってはじめて意味を持つ(design.md の設計判断)。
@@ -264,12 +266,21 @@ func parsePointerArg(name, value string) (Pointer, error) {
 	return p, nil
 }
 
-// optionalPointerArg は未指定(空文字列)を nil として扱うポインタ引数を解析する。
-// --cursor-key / --dedupe-key は「未指定」と「ルート」を区別する必要がないため、
-// 空文字列を未指定とみなす(ルートを指すカーソル・重複排除キーは意味を持たない)。
-func optionalPointerArg(name, value string) (*Pointer, error) {
-	if value == "" {
+// optionalPointerArg は「引数ごとの省略」を nil として扱うポインタ引数を解析する。
+// specified は引数が明示的に指定されたか(fs.Visit で得た事実)。
+//
+// 空文字列は RFC 6901 ではルートを指す有効な値だが(--path の "" はそのまま受け付ける、
+// 要件 2.1)、--cursor-key / --dedupe-key ではルートを指しても意味を持たない。
+// かといって空文字列を「未指定」と読み替えると、呼び出し元スクリプトが未設定の変数を
+// 展開して --cursor-key "" を渡した場合に黙ってカーソルなしとして動き、結果行では
+// 要件 5.4 の「0 件だから last_id なし」と区別できない。--in / --out の空文字列や
+// --max-record-bytes の 0 と同じ規律で、明示的な空文字列は引数不正とする(要件 7.3)。
+func optionalPointerArg(name, value string, specified bool) (*Pointer, error) {
+	if !specified {
 		return nil, nil
+	}
+	if value == "" {
+		return nil, usageErrorf("%s に空の JSON Pointer が指定されました(未指定にする場合は引数ごと省略してください)", name)
 	}
 	p, err := parsePointerArg(name, value)
 	if err != nil {
