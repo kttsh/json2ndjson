@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -66,10 +67,13 @@ func convertConfig(t *testing.T, path string, inputs ...string) *Config {
 }
 
 // runConvert は runConversion をテスト用シンクで実行する。
+//
+// 警告の出力先には nil を渡す。要件 6.6 の警告を捨てる指定であり、
+// 「nil を渡しても panic せずスキップ動作だけが残る」ことも同時に確かめている。
 func runConvert(t *testing.T, cfg *Config) (*ConvertResult, *testSink, error) {
 	t.Helper()
 	sink := &testSink{}
-	res, err := runConversion(cfg, sink)
+	res, err := runConversion(cfg, sink, nil)
 	return res, sink, err
 }
 
@@ -949,7 +953,7 @@ func TestRunConversionPropagatesSinkError(t *testing.T) {
 	want := &ExitError{Code: ExitOutput, Err: errors.New("書き込みに失敗しました")}
 	sink := &testSink{failAt: 2, failErr: want}
 
-	res, err := runConversion(convertConfig(t, "", in), sink)
+	res, err := runConversion(convertConfig(t, "", in), sink, nil)
 	if !errors.Is(err, want) {
 		t.Fatalf("シンクのエラーがそのまま返されていません: %v", err)
 	}
@@ -989,22 +993,29 @@ func TestIsInputIOError(t *testing.T) {
 	}
 }
 
-// --- (18) runConversionWithPipeline は警告の出力先を注入できる ------------------
-// tasks.md「未配線の契約」: SetWarnWriter はタスク 5.1 の責務であり、
-// convert は stderr を持たない。5.1 が Pipeline を組み立てて注入できること。
+// --- (18) 警告の出力先は runConversion の引数として注入する ---------------------
+// 要件 6.6 / tasks.md「未配線の契約」: SetWarnWriter はタスク 5.1 の責務であり、
+// convert は stderr を持たない。5.1 が渡した出力先へ警告が届くこと。
 
-func TestRunConversionWithPipelineAcceptsConfiguredPipeline(t *testing.T) {
+// oversizeSkipConfig は「1 件目は通り、2 件目がサイズ超過でスキップされる」入力と
+// Config を組み立てる。上限は 1 件目のバイト数ちょうど(== 上限は違反ではない)。
+func oversizeSkipConfig(t *testing.T) *Config {
+	t.Helper()
 	in := writeInput(t, "in.json", `[{"id":1},{"id":1234567890}]`)
 	cfg := convertConfig(t, "", in)
 	cfg.MaxRecordBytes = int64(len(`{"id":1}`))
 	cfg.SkipOversize = true
+	return cfg
+}
+
+// TestRunConversionWritesOversizeWarningToInjectedWriter は、注入した出力先へ
+// 実際に警告バイト列が書かれることを内容まで含めて確かめる(要件 6.6)。
+func TestRunConversionWritesOversizeWarningToInjectedWriter(t *testing.T) {
+	cfg := oversizeSkipConfig(t)
 
 	var warn bytes.Buffer
-	p := newPipeline(cfg)
-	p.SetWarnWriter(&warn)
-
 	sink := &testSink{}
-	res, err := runConversionWithPipeline(cfg, sink, p)
+	res, err := runConversion(cfg, sink, &warn)
 	if err != nil {
 		t.Fatalf("変換が失敗しました: %v", err)
 	}
@@ -1012,8 +1023,61 @@ func TestRunConversionWithPipelineAcceptsConfiguredPipeline(t *testing.T) {
 	if res.Records != 1 {
 		t.Errorf("Records が %d です(期待 1)", res.Records)
 	}
-	if warn.Len() == 0 {
-		t.Error("注入した警告出力先へ警告が書かれていません")
+
+	got := warn.String()
+	if got == "" {
+		t.Fatal("注入した警告出力先へ警告が 1 バイトも書かれていません")
+	}
+	// 「何か書かれた」だけでは要件 6.6 を満たしたことにならないため、
+	// スキップした事実と上限バイト数が読み取れることまで確かめる。
+	for _, want := range []string{"スキップ", strconv.FormatInt(cfg.MaxRecordBytes, 10)} {
+		if !strings.Contains(got, want) {
+			t.Errorf("警告に %q が含まれていません: %q", want, got)
+		}
+	}
+}
+
+// TestRunConversionWarnWriterCannotBeBypassed は、警告の出力先を持たない経路が
+// 再び現れたら失敗する回帰テストである。
+//
+// runConversion が内部で警告先なしの Pipeline を組み立てていると、呼び出し元が
+// 出力先を渡してもスキップ動作(Records の除外)だけが効いて警告が無言で消える。
+// コンパイル・静的解析・既存テストのいずれもこの状態を検出しないため、
+// 「渡した出力先に必ず届くこと」をここで固定する。
+func TestRunConversionWarnWriterCannotBeBypassed(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantWarn bool
+	}{
+		{name: "出力先を渡すと警告が書かれる", wantWarn: true},
+		{name: "nil を渡すと警告は書かれず panic もしない", wantWarn: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := oversizeSkipConfig(t)
+
+			var warn bytes.Buffer
+			// nil の場合は io.Writer インタフェース値そのものを nil にする。
+			var w io.Writer
+			if tt.wantWarn {
+				w = &warn
+			}
+
+			sink := &testSink{}
+			res, err := runConversion(cfg, sink, w)
+			if err != nil {
+				t.Fatalf("変換が失敗しました: %v", err)
+			}
+			// 警告の有無にかかわらずスキップ動作は変わらない。
+			assertLines(t, sink.lines(), []string{`{"id":1}`})
+			if res.Records != 1 {
+				t.Errorf("Records が %d です(スキップ除外後の 1 を期待)", res.Records)
+			}
+			if gotWarn := warn.Len() > 0; gotWarn != tt.wantWarn {
+				t.Errorf("警告の有無が %v です(期待 %v): %q", gotWarn, tt.wantWarn, warn.String())
+			}
+		})
 	}
 }
 

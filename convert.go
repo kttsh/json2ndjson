@@ -58,20 +58,24 @@ type RecordSink interface {
 // Invariants: 入力ファイルを変更しない。stdout / stderr へ書かない。
 // 処理順は cfg.Inputs の順(整列は cli の責務であり、ここでは並べ替えない)。
 //
-// 整形パイプラインは cfg から内部で構築する。警告の出力先(SetWarnWriter)を
-// 注入したい呼び出し元(タスク 5.1 の main)は runConversionWithPipeline を使う。
-func runConversion(cfg *Config, sink RecordSink) (*ConvertResult, error) {
-	return runConversionWithPipeline(cfg, sink, newPipeline(cfg))
-}
-
-// runConversionWithPipeline は組み立て済みの整形パイプラインを受け取る runConversion。
+// # warn 引数が design.md と異なる理由
 //
-// design.md が公開する契約は runConversion のシグネチャだが、--skip-oversize の警告先
-// (Pipeline.SetWarnWriter)は stderr を所有する main しか渡せない。convert は stdout /
-// stderr へ書かない不変条件があるため os.Stderr を自前で参照できず、かといって
-// runConversion のシグネチャは変えられない。そこで「パイプラインを外から渡す入口」を
-// 1 本足し、runConversion をその既定値版とする。
-func runConversionWithPipeline(cfg *Config, sink RecordSink, pipeline *Pipeline) (*ConvertResult, error) {
+// design.md が公開するシグネチャは引数 2 つ(cfg, sink)だが、ここでは警告の出力先
+// warn を第 3 引数として必ず受け取る。--skip-oversize でスキップしたレコードの警告
+// (要件 6.6)の宛先は stderr を所有する main のものであり、convert は stdout / stderr
+// へ書かない不変条件があるため os.Stderr を自前で参照できない。したがって引数 2 つの
+// 形では、呼び出し元が警告先を渡す手段がなく要件 6.6 を無言で満たせなくなる
+// (スキップ動作だけが効き、警告は捨てられる。コンパイル・静的解析・テストのいずれも
+// これを検出しない)。入口を 1 本に保ったまま宛先を型で強制するため、
+// design.md の 2 引数形ではなくこの形を採る。
+//
+// warn が nil の場合は「警告を書かない」指定として扱う(Pipeline.SetWarnWriter の
+// 既定と同じ無操作)。スキップ動作そのものは warn の有無に影響されない。
+// convert は warn を受け流すだけで、自身は決して stdout / stderr を参照しない。
+func runConversion(cfg *Config, sink RecordSink, warn io.Writer) (*ConvertResult, error) {
+	pipeline := newPipeline(cfg)
+	pipeline.SetWarnWriter(warn)
+
 	c := &converter{cfg: cfg, sink: sink, pipeline: pipeline, result: &ConvertResult{}}
 	for _, name := range cfg.Inputs {
 		if err := c.convertFile(name); err != nil {
