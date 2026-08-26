@@ -7,3 +7,8 @@
 .env.development
 .env.test
 .env.production
+
+# ビルド成果物(`go build ./...` はリポジトリ直下に実行ファイルを生成する)
+/json2ndjson
+/json2ndjson.exe
+/dist/

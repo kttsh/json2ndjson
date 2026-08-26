@@ -1,0 +1,7 @@
+{
+  "data" : [ { "id" : 1 } ] ,
+  "note" : "文字列です" ,
+  "nothing" : null ,
+  "count" : 3 ,
+  "flag" : true
+}
