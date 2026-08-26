@@ -13,9 +13,12 @@
 //
 // 【サードパーティ依存について】
 // Windows のファイルロック(LockFileEx)用の golang.org/x/sys を唯一の依存とする(IMPL-02)。
-// 本タスクの時点では x/sys を import するソース(lock_windows.go)が存在しないため、
-// ここに require を書いても `go mod tidy` が即座に削除して go.mod を書き換えてしまう。
-// require の追加は lock_windows.go を作成するタスク 3.1 で行う。
+// タスク 3.1 で lock_windows.go(//go:build windows)を追加したことにより require が確定した。
+// import が Windows 向けビルドにしか現れないため直接依存に見えないおそれがあるが、
+// `go mod tidy` は全ビルド構成を考慮するため直接依存として保持される(実測確認済み)。
+// これ以外のサードパーティモジュールは追加しない。
 module github.com/kttsh/json2ndjson
 
 go 1.25.1
+
+require golang.org/x/sys v0.47.0
