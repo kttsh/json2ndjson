@@ -51,7 +51,7 @@
   - 完了条件: 書き込み途中の失敗を注入しても出力パスにファイルが存在しないことを含む、新規作成系のテストがすべて成功する
   - _Requirements: 3.3, 3.4, 3.5, 3.10, 4.1, 4.2, 4.6, 4.7, 11.4_
 
-- [ ] 3.3 出力ファイル管理: 追記モードとロールバック
+- [x] 3.3 出力ファイル管理: 追記モードとロールバック
   - 出力ファイル自身に排他ロックを取得し、開始前サイズを記録する。既存ファイルは末尾 1 バイトのみを読んで改行を確認し、不足時は補ってから追記する
   - 追記中の失敗時は開始前サイズへ切り詰めて元の状態に戻す。既存ファイルがなければ新規に作成して追記扱いとする
   - 追記行にも改行コード(LF/CRLF)と最終行改行の設定を適用する
@@ -128,7 +128,12 @@
 - **タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**(要件 9.4 / NFR-05、タスク 2.2)。未配線でもコンパイル・静的解析・テストのいずれも失敗しない(Go では未使用の定数はエラーにならず、テストが参照しているため未使用検出にもかからない)。4.1 に「`--help` 出力が `dedupeMemoryNote` を含むこと」を検証するテストを課すこと。あわせて「`--dedupe-key` の指定位置が存在しないレコードは重複排除の対象外として常に出力される」旨もヘルプに 1 行記載することが望ましい。
 - ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
 - **タスク 3.3 は `output_test.go` の `TestOpenOutputAppendModeIsNotWiredYet` を、追記モードの本来のテストへ置き換えること**(タスク 3.2)。これは追記の継ぎ目が未実装であることを固定する「見張り番」テストで、3.3 が追記を実装した時点で失敗する(それが意図)。現状この指示は `output_test.go` のコメントにしかなく、3.3 の担当者が先に読む保証がないためここに記録する。なお未結線の継ぎ目は終了コード **9(`ExitInternal`)** を返す設計とした(4 を返すと未実装経路が「環境側の失敗=リトライ・調査対象」を装い、呼び出し元の切り分けを誤らせるため)。
-- **タスク 3.3 は追記モードの出力ファイルを `os.O_RDWR|os.O_APPEND|os.O_CREATE` で開くこと。`os.O_WRONLY|os.O_APPEND` は Windows 実機でのみ排他が壊れる**(タスク 3.1 のレビューで発見、コントローラが Go のソースで裏取り済み)。理由: `syscall.Open`(`/usr/local/go1.25.1/src/syscall/syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `access &^= GENERIC_WRITE` を行う。`O_WRONLY|O_APPEND|O_CREATE` では GENERIC_READ も GENERIC_WRITE も残らず、`LockFileEx` が要求する「GENERIC_READ または GENERIC_WRITE で開かれたハンドル」を満たさないため `tryLock` が `ERROR_ACCESS_DENIED` を返す。この値は `ErrLocked` へ写像されず `default:` 分岐で素通しされるので、**要件 4.6 の排他が無言で機能しなくなる**。`O_RDWR|O_APPEND` なら GENERIC_READ が残り成立する(末尾 1 バイトを読む必要からも読み取り権限は必要)。Linux では no-op のため**コンパイル・静的解析・テストのいずれでも検出できない**。
+- **【重要・タスク 3.4 が必ず読むこと】追記先のハンドルに `os.O_APPEND` を付けてはならない。付けると Windows で `File.Truncate` が必ず失敗する**(タスク 3.3 のレビューで発見、コントローラが Go のソースで裏取り済み)。`syscall.Open`(`syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `GENERIC_WRITE` を落とし、「`GENERIC_WRITE` が与える権利のうち **`FILE_WRITE_DATA` を除く**すべて」を付け直す(Go 自身のコメント)。一方 `os.File.Truncate` → `syscall.Ftruncate`(同 `:651-659`)は `setFileInformationByHandle(FileEndOfFileInfo)` で、これは `FILE_WRITE_DATA` を要求する。Go 自身が「`O_TRUNC` のときは切り詰めのために `GENERIC_WRITE` が要る」と書いているのが決定的な裏付け。
+  - 帰結: `O_APPEND` 付きだとロールバックの切り詰めがハンドル経由では必ず失敗し、ロックを解放した後のパス経由 `os.Truncate` へ落ちる。排他が実体を持つ唯一の OS で、Abort のたびに他プロセスの追記データを破壊しうる窓が開く。**Linux では `O_APPEND` な fd への `ftruncate` が成功するため、テスト・`go vet`・`staticcheck`・クロスビルドのいずれでも検出できない。**
+  - 現在の実装: `const appendOpenFlags = os.O_RDWR | os.O_CREATE`(`output.go`)。書き込み位置は `Seek(baseSize, io.SeekStart)` で明示する(実行中は排他ロックを保持する単独ライタのため `O_APPEND` の原子性は不要。書き始め位置と切り詰め先を同一の測定値に固定する意図もある)。`TestAppendOpenFlagsAreWindowsSafe` がこの定数を見張っている。
+  - **タスク 3.4 のジャーナル復旧も切り詰めを行うため、同じ罠を踏まないこと。**
+- ~~**タスク 3.3 は追記モードの出力ファイルを `os.O_RDWR|os.O_APPEND|os.O_CREATE` で開くこと**~~ — 上記のとおり `O_APPEND` は**外した**。`O_WRONLY` が禁止である理由(要件 4.5 の末尾 1 バイト読み取りに読み取り権限が要る／Windows では `GENERIC_READ` も `GENERIC_WRITE` も残らず `LockFileEx` が `ERROR_ACCESS_DENIED` になる)は引き続き有効。元の記述は以下のとおり:
+  - **`os.O_WRONLY|os.O_APPEND` は Windows 実機でのみ排他が壊れる**(タスク 3.1 のレビューで発見、コントローラが Go のソースで裏取り済み)。理由: `syscall.Open`(`/usr/local/go1.25.1/src/syscall/syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `access &^= GENERIC_WRITE` を行う。`O_WRONLY|O_APPEND|O_CREATE` では GENERIC_READ も GENERIC_WRITE も残らず、`LockFileEx` が要求する「GENERIC_READ または GENERIC_WRITE で開かれたハンドル」を満たさないため `tryLock` が `ERROR_ACCESS_DENIED` を返す。この値は `ErrLocked` へ写像されず `default:` 分岐で素通しされるので、**要件 4.6 の排他が無言で機能しなくなる**。`O_RDWR|O_APPEND` なら GENERIC_READ が残り成立する(末尾 1 バイトを読む必要からも読み取り権限は必要)。Linux では no-op のため**コンパイル・静的解析・テストのいずれでも検出できない**。
 - **タスク 3.2 / 3.3 は Linux 上で「同時実行 → 終了コード 4」を検証できない**(タスク 3.1)。非 Windows の `tryLock` は no-op で、同一パスの 2 本のハンドルが両方ロックに成功する(`TestTryLockIsNoOpOnNonWindows` が明示的に固定)。design.md の `output_test.go` 行と「Validation: 同時実行」はこの環境では充足不能。排他テストは `runtime.GOOS != "windows"` で Skip するか Windows 受け入れテストへ委譲し、**3.2/3.3 は「要件 4.6 を検証済み」と主張してはならない**。
 - **タスク 3.2 / 3.3 は `RecordSink.WriteRecord` が受け取る `compact` を呼び出しを越えて保持してはならない**(タスク 2.3)。convert はレコードバッファを再利用するため、呼び出し後に内容が書き換わる(実測確認済み)。`bufio.Writer` へ即時に書き出す実装なら制約に抵触しない。保持する必要がある実装は自分で写しを取ること。この寿命契約は design.md には無く、`convert.go` の `RecordSink` インターフェースの doc コメントに記載されている。
 
@@ -150,7 +155,19 @@
 - `Finalize` 成功後に `main` の defer が `Abort` を呼ぶ経路で確定済みの出力を消さないよう、状態でガードしている。
 - `Config.Newline` がゼロ値のときは既定の LF(要件 3.3)へ正規化する。値域の検証自体はタスク 4.1 の責務。
 
+### タスク 3.3 が確定した output の契約(追記モード)
+
+- 追記は**出力ファイル自身**にロックを取る(新規モードは一時ファイルにロックを取る)。
+- 手順は「開く(なければ作成)→ ロック → **[3.4 のジャーナル復旧はここ]** → `Stat` で開始前サイズ記録 → 末尾 1 バイトで改行判定 → `Seek(baseSize, io.SeekStart)`」。復旧をロック取得後・`Stat` より前に置かないと、復旧前の誤ったサイズを開始前サイズとして記録してしまう。
+- **補完の改行は `openAppend` では書かず、最初の `WriteRecord` まで遅らせる。** これにより design.md の不変条件「ジャーナルが sync される前に追記の 1 バイト目を書かない」を、**タスク 3.4 は `openAppend` の末尾にジャーナル作成+sync を置くだけで満たせる**(`openAppend` はファイルへ 1 バイトも書かない)。0 件の追記がファイルを 1 バイトも変えないという要件 4.5/3.10 の解釈とも一致する。
+- `--append` が新規作成したファイルの `Abort` は**削除ではなく 0 バイトへの切り詰め**。要件 4.9 の復元先は「追記開始前のサイズ」で、新規作成時それは 0。削除は「自分が作ったのか他者が作ったのか」を区別できない。
+- `rollbackAppend` にはパス経由 `os.Truncate` のフォールバックがあるが、これは**ロック解放後に走るため他プロセスの追記データを破壊しうる**。正規経路はハンドル経由の切り詰め(ロック保持下)であり、フォールバックは真の最終手段。`TestAbortTruncatesThroughOpenHandle` が、正規経路が実際に使われていることを見張っている(Abort 直前にファイルを rename して退避し、パス経由では届かない状況を作る)。
+- 切り詰め後の fsync は行っていない。切り詰め直後の強制終了はタスク 3.4 のジャーナルが救う範囲。
+
 ### 未解決の所見(ブロッキングではない)
+
+- **タスク 3.3 で「テスト不能」と申告した変異 2 件は、実際には既存のシームで検出可能**(再レビューが実証)。(a) `Seek` の基準(`baseSize` からの `SeekStart` vs `SeekEnd`)は、`Stat` と `Seek` の間で呼ばれる `tail io.ReaderAt` に副作用でファイルを伸長させれば区別できる。(b) `Seek` のエラー分岐は `os.Pipe()` の書き込み端(`Stat` が size 0 を返し `Seek` が ESPIPE で失敗)で到達できる。いずれも本番挙動に差はなく fail-closed のため非ブロッキングだが、「テスト不能」ではなく「未テスト」が正確。
+- **`output.go` のコメントが Go ソースのアクセス権組み立てを「`syscall_windows.go:376-395`」と引用しているが、実際の開始行は 373**。引用文字列自体は逐語一致しており実害なし。
 
 - **`file.Sync()` のエラーを無視する変異がテストで検出されない**(タスク 3.2)。0 件経路では `bufio.Writer.Flush` が nil を返し、続く `Sync` と `Close` がともに同じエラーを返すため、Sync 検査の除去が観測できない構造的な理由による。検出には `*os.File` をインターフェース化する必要があり、耐久性のみに影響する検査のために本番経路を劣化させる判断として見送った。
 - **壊れたシンボリックリンクを「存在する」と扱う `Lstat` の採用根拠を固定するテストがない**(タスク 3.2)。`Stat` への変異が生存する。
