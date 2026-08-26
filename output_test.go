@@ -824,6 +824,61 @@ func TestAbortAfterPartialAppendRestoresPreAppendSize(t *testing.T) {
 	}
 }
 
+// TestAbortTruncatesThroughOpenHandle は、ロールバックの切り詰めが
+// **開いたままのハンドル経由**で行われることを検証する(要件 4.4 / FR-23、4.9 / FR-39)。
+//
+// これは性能の話ではなく排他の話である。ハンドル経由の切り詰めはロックを保持したまま
+// 完了するが、パス経由の os.Truncate は closeFile がロックを解放した後に走るため、
+// 別プロセスがロックを取得して追記を始めた直後であればその追記ごと切り詰めうる。
+// パス経由はあくまで最後の手段であって、通常の中断経路であってはならない。
+//
+// 「ハンドル経由かパス経由か」は結果のバイト列では区別できない。そこで中断の直前に
+// 出力ファイルを別名へ移す。ハンドルは inode を掴んでいるので切り詰めが届くが、
+// パス経由の os.Truncate は元のパスに何も無いため失敗する。移した先が開始前サイズに
+// 戻っていれば、ハンドル経由が実際に効いたことの証明になる。
+//
+// Windows は開いているファイルの移動を許さない(共有モードに FILE_SHARE_DELETE を
+// 含めていない)ため、この手法は非 Windows 限定である。検証している不変条件そのものは
+// Windows のためのものだが、退行はここで捕まえられる。
+func TestAbortTruncatesThroughOpenHandle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("開いているファイルを移動できないため、この手法は Windows では使えない")
+	}
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	moved := filepath.Join(dir, "moved.ndjson")
+	const original = `{"既存":"末尾に改行がない行"}`
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, bigRecord("a"), bigRecord("b"))
+
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("追記中のファイルを stat できない: %v", err)
+	}
+	if info.Size() <= int64(len(original)) {
+		t.Fatalf("テストの前提が崩れている(追記がまだファイルへ届いていない): size=%d", info.Size())
+	}
+
+	// ここから先、cfg.Out のパスには何も存在しない。パス経由の切り詰めは届かない。
+	if err := os.Rename(out, moved); err != nil {
+		t.Fatalf("追記中のファイルを移動できない: %v", err)
+	}
+
+	om.Abort()
+
+	assertNotExist(t, out, "移動した後の出力パス")
+
+	got := readOutput(t, moved)
+	if string(got) != original {
+		t.Errorf("ハンドル経由の切り詰めが効いていない(パス経由の os.Truncate に頼っている)。"+
+			"ロールバックはロックを保持したまま完了しなければならない\n size=%d want_size=%d",
+			len(got), len(original))
+	}
+}
+
 // TestWriteRecordFailureDuringAppendRestoresFile は、追記中の書き込み失敗が
 // 終了コード 4 で報告され、その後の中断で既存ファイルが開始前サイズへ戻ることを
 // 検証する(要件 4.4 / FR-23、要件 4.9 / FR-39)。
@@ -1091,6 +1146,102 @@ func TestNeedsNewlinePaddingReportsReadFailure(t *testing.T) {
 	r := &countingReaderAt{data: []byte(`{"a":1}`), err: want}
 	if _, err := needsNewlinePadding(r, int64(len(r.data))); !errors.Is(err, want) {
 		t.Errorf("読み取り失敗が伝播しない: %v", err)
+	}
+}
+
+// TestAppendOpenFlagsAreWindowsSafe は、追記先を開くフラグが Windows 固有の 2 つの
+// 罠を踏んでいないことを、フラグの値そのもので見張る。
+//
+// この 2 つはどちらも非 Windows では一切症状が出ない(ロックは no-op、ftruncate は
+// O_APPEND の fd でも成功する)。実行によるテストも `GOOS=windows go vet` も
+// クロスコンパイルも捕まえられないため、値の検査だけが Linux 側に残された防御になる。
+//
+//   - O_APPEND があると、Windows のハンドルは FILE_WRITE_DATA を失う
+//     (syscall_windows.go:386-395)。os.File.Truncate は
+//     SetFileInformationByHandle(FileEndOfFileInfo) 経由でそれを要求するため、
+//     rollbackAppend のハンドル経由の切り詰めが必ず失敗し、ロックを解放した後の
+//     パス経由の切り詰めへ落ちる。すなわち中断のたびに、他プロセスがロックを
+//     取得しうる窓の中で切り詰めることになる(要件 4.4 / FR-23、4.9 / FR-39)。
+//   - O_RDWR でないと、末尾 1 バイトの読み取り(要件 4.5 / FR-24)ができないうえ、
+//     Windows では LockFileEx が要求するアクセス権を失う(要件 4.6 / FR-25)。
+func TestAppendOpenFlagsAreWindowsSafe(t *testing.T) {
+	if appendOpenFlags&os.O_APPEND != 0 {
+		t.Error("追記先を O_APPEND で開いている。Windows でハンドル経由の Truncate が" +
+			"必ず失敗し、ロック解放後のパス経由の切り詰めへ落ちる")
+	}
+	if appendOpenFlags&os.O_RDWR == 0 {
+		t.Error("追記先が O_RDWR で開かれていない。末尾 1 バイトを読めず、" +
+			"Windows では LockFileEx も失敗する")
+	}
+	if appendOpenFlags&os.O_TRUNC != 0 {
+		t.Error("追記先を O_TRUNC で開いている。既存の内容を破棄してしまう")
+	}
+	if appendOpenFlags&os.O_CREATE == 0 {
+		t.Error("追記先が O_CREATE で開かれていない。既存ファイルがない場合に" +
+			"新規作成する要件 4.3 / FR-22 を満たせない")
+	}
+}
+
+// TestPrepareAppendStopsWhenPaddingProbeFails は、末尾 1 バイトの読み取りが失敗した
+// ときに追記の準備そのものが停止することを、**呼び出し側**で検証する
+// (要件 4.5 / FR-24、要件 4.3 / FR-22 の準備段)。
+//
+// TestNeedsNewlinePaddingReportsReadFailure は needsNewlinePadding が
+// エラーを返すことしか縛らない。呼び出し側が `pad, _ := ...` と受けてエラーを捨てても
+// あの 1 本は通る。そのとき pad は false になり、末尾が改行で終わっていない追記先へ
+// 改行を補わずに書き足す — 完了条件が禁じている「行の連結」そのものが起きる。
+// この 1 本だけが、その退行を落とす。
+//
+// 実ファイルの ReadAt を確実に失敗させる手立てが(root 実行下では権限操作を含めて)
+// ないため、prepareAppend は末尾読み取り先を引数で受ける。本番の openAppend は
+// 開いたファイル自身を渡すので、経路は同じで間接も増えない。
+func TestPrepareAppendStopsWhenPaddingProbeFails(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	// 末尾が改行で終わっていない既存ファイル。握り潰した場合に実害
+	//(行の連結)が出るのはこの形である。
+	const original = `{"旧":1}`
+	writeExisting(t, out, original)
+
+	f, err := os.OpenFile(out, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatalf("追記先を開けない: %v", err)
+	}
+
+	wantErr := errors.New("末尾を読めない")
+	probe := &countingReaderAt{data: []byte(original), err: wantErr}
+
+	om, err := prepareAppend(newAppendConfig(out), f, probe)
+	if err == nil {
+		om.Abort()
+		t.Fatal("末尾 1 バイトを読めないのに準備が成功した(エラーを握り潰すと、" +
+			"改行を補わずに追記して行を連結する)")
+	}
+	if om != nil {
+		t.Error("失敗したのに OutputManager を返している")
+	}
+	if got := exitCodeOf(t, err); got != ExitOutput {
+		t.Errorf("終了コードが %d。%d でなければならない", got, ExitOutput)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("読み取り失敗の原因が伝播していない: %v", err)
+	}
+	if !strings.Contains(err.Error(), out) {
+		t.Errorf("エラーに追記先のパスが含まれない: %v", err)
+	}
+	if probe.calls != 1 {
+		t.Errorf("末尾判定の ReadAt が %d 回。1 回でなければならない", probe.calls)
+	}
+
+	// 失敗経路はロックを解放してハンドルを閉じなければならない。閉じ忘れると
+	// Windows では以後だれもこの出力ファイルを扱えなくなる。
+	if err := f.Close(); !errors.Is(err, fs.ErrClosed) {
+		t.Errorf("失敗経路がハンドルを閉じていない(再クローズの結果が %v)", err)
+	}
+
+	// 準備に失敗したのだから、既存ファイルは 1 バイトも変わっていてはならない。
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("既存ファイルが書き換わっている: %q", got)
 	}
 }
 

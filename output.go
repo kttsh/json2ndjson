@@ -171,28 +171,72 @@ func openNew(cfg *Config) (*OutputManager, error) {
 // openAppend は追記モードの準備を行う(design.md「output」の「追記モード」)。
 //
 // 手順は「出力ファイルを開く(なければ作成)→ 出力ファイル自身をロック →
-// 開始前サイズを記録 → 末尾 1 バイトで改行の有無を確認」。
+// 開始前サイズを記録 → 末尾 1 バイトで改行の有無を確認 → 書き込み位置を末尾へ合わせる」。
+// 開く以降の段は prepareAppend が担う。
 // 新規作成モードと違い、ロックの対象は一時ファイルではなく出力ファイル自身である
 // (design.md「排他」: 「追記はロックを出力ファイル自身に取得」)。追記は出力パスへ
 // 直接書き足すため、守るべき対象が出力ファイルそのものだからである。
 func openAppend(cfg *Config) (*OutputManager, error) {
-	// 【O_RDWR は必須。O_WRONLY へ「単純化」してはならない】
-	// Windows の syscall.Open は O_APPEND かつ O_TRUNC なしのとき GENERIC_WRITE を
-	// 落とす(syscall_windows.go)。O_WRONLY|O_APPEND|O_CREATE では GENERIC_READ も
-	// GENERIC_WRITE も残らないハンドルになり、そのどちらかを要求する LockFileEx が
-	// ERROR_ACCESS_DENIED で失敗する。その値は ErrLocked へ写像されず素通しされるため、
-	// 要件 4.6 / FR-25 の同時実行排他が Windows 実機でのみ無言で壊れる
-	// (非 Windows の tryLock は no-op のため、テストでも静的解析でも検出できない)。
-	// O_RDWR なら GENERIC_READ が残り成立する。末尾 1 バイトの読み取り(要件 4.5)にも
-	// 読み取り権限が要る。
-	f, err := os.OpenFile(cfg.Out, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(cfg.Out, appendOpenFlags, 0o644)
 	if err != nil {
 		return nil, &ExitError{
 			Code: ExitOutput,
 			Err:  fmt.Errorf("追記先 %q を開けない: %w", cfg.Out, err),
 		}
 	}
+	return prepareAppend(cfg, f, f)
+}
 
+// appendOpenFlags は追記先を開くときのフラグ。
+//
+// 【この組み合わせは 2 つの Windows 固有の制約に挟まれている。O_WRONLY へ
+// 「単純化」してもならず、O_APPEND を「追記なのだから」と足してもならない。
+// どちらも非 Windows では一切症状が出ない。】
+//
+// 前提: Go の syscall.Open は Windows で次のようにアクセス権を組み立てる
+// (/usr/local/go1.25.1/src/syscall/syscall_windows.go:376-395)。
+//   - O_RDONLY→GENERIC_READ / O_WRONLY→GENERIC_WRITE / O_RDWR→両方
+//   - O_CREAT があれば GENERIC_WRITE を追加
+//   - O_APPEND があれば、O_TRUNC が無い限り GENERIC_WRITE を落とし
+//     ("Remove GENERIC_WRITE unless O_TRUNC is set, in which case we need it
+//     to truncate the file")、代わりに "Set all access rights granted by
+//     GENERIC_WRITE except for FILE_WRITE_DATA"(FILE_APPEND_DATA |
+//     FILE_WRITE_ATTRIBUTES | _FILE_WRITE_EA | STANDARD_RIGHTS_WRITE |
+//     SYNCHRONIZE)だけを足す
+//
+// (1) O_RDWR は必須(O_WRONLY にしてはならない)。要件 4.5 / FR-24 の末尾 1 バイトの
+// 読み取りに読み取り権限が要る。加えて Windows では、O_WRONLY に O_APPEND を併せると
+// GENERIC_READ も GENERIC_WRITE も残らないハンドルになり、そのどちらかを要求する
+// LockFileEx が ERROR_ACCESS_DENIED で失敗する。その値は ErrLocked へ写像されず
+// 素通しされるため、要件 4.6 / FR-25 の同時実行排他が Windows 実機でのみ無言で壊れる。
+//
+// (2) O_APPEND は付けてはならない(「追記なのだから自然」という直感に反する)。
+// 上記のとおり O_APPEND を付けたハンドルには FILE_WRITE_DATA が無い。ところが
+// os.File.Truncate は Windows では poll.FD.Ftruncate → syscall.Ftruncate →
+// SetFileInformationByHandle(FileEndOfFileInfo) に落ちており、これは FILE_WRITE_DATA を
+// 要求する。したがって O_APPEND を付けると rollbackAppend のハンドル経由の切り詰めが
+// Windows で必ず ERROR_ACCESS_DENIED になり、ロックを解放した後のパス経由の切り詰め
+// (最後の手段)へ毎回落ちる。ロックが実体を持つ唯一の OS で、あらゆる中断が
+// ロックの外側で切り詰めることになる。
+//
+// O_APPEND を落とした代わりに、開始前サイズの記録後に書き込み位置を明示的に合わせる
+// (prepareAppend の Seek)。実行中はこのプロセスが排他ロックを保持する唯一の書き手で
+// あり(要件 4.6 / FR-25)、O_APPEND の「書き込みのたびに末尾へ原子的に位置づける」
+// 性質は必要ない。
+//
+// 非 Windows ではどちらの制約も症状が出ないため、TestAppendOpenFlagsAreWindowsSafe が
+// この定数の値そのものを見張っている。
+const appendOpenFlags = os.O_RDWR | os.O_CREATE
+
+// prepareAppend は追記モードの準備のうち「開いたファイルを受け取ってからの段」を担う
+// (ロック取得 → 開始前サイズの記録 → 末尾 1 バイトの確認 → 書き込み位置の設定)。
+// 失敗した場合は f を必ずロック解放して閉じ、OutputManager を返さない。
+//
+// tail は末尾 1 バイトの読み取り先で、本番では f 自身を渡す。分けてあるのは、
+// 読み取りが失敗したときにここが必ず停止する(=改行の補完を諦めて行を連結させない)
+// ことをテストで固定できるようにするためである。needsNewlinePadding が
+// io.ReaderAt を受けるのと同じ理由で、本番の経路には何の間接も増えない。
+func prepareAppend(cfg *Config, f *os.File, tail io.ReaderAt) (*OutputManager, error) {
 	if err := tryLock(f); err != nil {
 		// 出力ファイルは自分が作ったとは限らないため、新規モードの一時ファイルと違い
 		// 削除しない(実行前から存在したデータを失わないこと、要件 4.9)。
@@ -225,12 +269,34 @@ func openAppend(cfg *Config) (*OutputManager, error) {
 	}
 	baseSize := info.Size()
 
-	pad, err := needsNewlinePadding(f, baseSize)
+	pad, err := needsNewlinePadding(tail, baseSize)
 	if err != nil {
+		// ここで握り潰して pad=false に倒すと、末尾が改行で終わっていない追記先へ
+		// 改行を補わずに書き足し、1 行に 2 レコードが乗った不正な NDJSON になる
+		// (要件 4.5 / FR-24)。読めなかったのなら追記を始めてはならない。
 		closeLocked(f)
 		return nil, &ExitError{
 			Code: ExitOutput,
 			Err:  fmt.Errorf("追記先 %q の末尾 1 バイトを読めない: %w", cfg.Out, err),
+		}
+	}
+
+	// O_APPEND を使わない(appendOpenFlags の注記 (2))ため、書き込み位置は明示的に
+	// 合わせる必要がある。開いた直後のオフセットは 0 であり、ここを怠ると既存内容を
+	// 先頭から上書きする。
+	//
+	// Seek(0, io.SeekEnd) ではなく Seek(baseSize, io.SeekStart) を使う。書き込みを
+	// 始める位置と、ロールバックが戻す位置(baseSize)を同一の測定値に固定するためで
+	// ある。末尾を測り直すと、Stat と Seek の間にサイズが変わった場合に「書き始めた
+	// 位置」と「切り詰め先」がずれ、要件 4.4 / FR-23 の「追記開始前のサイズへ戻す」が
+	// 穴あき(または他者の書き込みの巻き添え)になりうる。baseSize 基準なら
+	// 「この実行が書いたバイトは必ず baseSize 以降にある」が構成上成り立つ。
+	// タスク 3.4 のジャーナル復旧が切り詰めた直後でも、同じ理由で正しい位置になる。
+	if _, err := f.Seek(baseSize, io.SeekStart); err != nil {
+		closeLocked(f)
+		return nil, &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q の書き込み位置を末尾へ移せない: %w", cfg.Out, err),
 		}
 	}
 
@@ -624,8 +690,16 @@ func (o *OutputManager) Abort() {
 func (o *OutputManager) rollbackAppend() {
 	truncated := false
 	if o.file != nil && !o.closed {
-		// ハンドル経由で切り詰める。ロックを保持したまま行うため、Windows でも
-		// 他プロセスに割り込まれない。
+		// ハンドル経由で切り詰める。これが正規の経路であり、ロックを保持したまま
+		// 完了するため他プロセスに割り込まれない。
+		//
+		// これが Windows でも成り立つのは、appendOpenFlags が O_APPEND を含まないから
+		// である。O_APPEND を付けたハンドルには FILE_WRITE_DATA が無く
+		// (syscall_windows.go:386-395)、os.File.Truncate が使う
+		// SetFileInformationByHandle(FileEndOfFileInfo) はそれを要求するため、
+		// ここが必ず ERROR_ACCESS_DENIED になって下のパス経由へ落ちてしまう。
+		// appendOpenFlags とこの一行は一組の不変条件であり、前者は
+		// TestAppendOpenFlagsAreWindowsSafe が見張っている。
 		if err := o.file.Truncate(o.baseSize); err == nil {
 			truncated = true
 		}
@@ -635,11 +709,20 @@ func (o *OutputManager) rollbackAppend() {
 	o.closeFile()
 
 	if !truncated {
-		// ハンドルが使えない状態(確定手順の途中で閉じた後の失敗、書き込み失敗で
-		// ディスクリプタが無効になった場合など)でも、開始前サイズへ戻すことは
-		// 諦めずパス経由で試みる。Abort は戻り値を持たない best effort の処理であり
-		// (design.md の署名どおり)、ここで失敗しても報告経路はない。
-		// プロセスごと強制終了された場合の復旧は、タスク 3.4 のジャーナルが担う。
+		// 【最後の手段。正規の経路ではない】ハンドルが使えない状態(確定手順の途中で
+		// 閉じた後の失敗、書き込み失敗でディスクリプタが無効になった場合など)でも、
+		// 開始前サイズへ戻すことは諦めずパス経由で試みる。
+		//
+		// ただしこの切り詰めは上の closeFile でロックを解放した後に走る。すなわち
+		// 別プロセスが同じ出力ファイルのロックを取得して追記を始めた直後であれば、
+		// その追記ごと baseSize へ切り詰めてしまう窓がある。ハンドル経由の切り詰めを
+		// 何としても成立させ、ここへ落ちないようにしておくことが重要なのはこのためで
+		// ある。それでも試みるのは、「開始前サイズへ戻らないまま終わる」ほうが
+		// 要件 4.4 / FR-23・4.9 / FR-39 に対して確実に悪いからである。
+		//
+		// Abort は戻り値を持たない best effort の処理であり(design.md の署名どおり)、
+		// ここで失敗しても報告経路はない。プロセスごと強制終了された場合の復旧は、
+		// タスク 3.4 のジャーナルが担う。
 		_ = os.Truncate(o.cfg.Out, o.baseSize)
 	}
 
