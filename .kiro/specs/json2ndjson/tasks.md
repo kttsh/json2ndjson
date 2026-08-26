@@ -65,7 +65,7 @@
   - _Requirements: 4.8, 4.9_
 
 - [ ] 4. CLI
-- [ ] 4.1 (P) 引数解析と設定の検証
+- [x] 4.1 (P) 引数解析と設定の検証
   - 全引数(入力・出力・位置・追記・上書き・改行・最終行改行・カーソル・重複排除・キー置換・固定値追加・上限バイト・スキップ・バージョン・ヘルプ)を受け付け、入力と固定値追加の複数指定に対応する。解析結果は基盤タスクで定義済みの設定構造体(Config)へ格納する(構造体定義には手を入れない)
   - 必須欠落、未知の引数、追記と上書きの同時指定、改行の値域、ポインタ構文、キー=値形式、サイズスキップの単独指定をいずれも終了コード 1 として検証する
   - 入力ファイル群をファイル名(ベース名、同名時はフルパス)の昇順に整列する。バージョンとヘルプは表示して終了コード 0 とする
@@ -125,7 +125,10 @@
 
 - ~~**タスク 5.1 は `Pipeline.SetWarnWriter(stderr)` を必ず呼ぶこと**~~ — **タスク 2.3 の是正により解消済み。5.1 は `SetWarnWriter` を知る必要がない。** 変換の入口は `runConversion(cfg *Config, sink RecordSink, warn io.Writer)` の 1 本に統合され、内部で `newPipeline(cfg)` + `SetWarnWriter(warn)` を必ず行う。**タスク 5.1 は `runConversion(cfg, sink, stderr)` を呼ぶこと**(第 3 引数を省くとコンパイルエラーになるため、要件 6.6 の警告が無言で消えることはもう起こらない)。`warn` に nil を渡すと警告は抑止される(panic はしない)。なお 5.1 の完了条件には引き続き「`--max-record-bytes` + `--skip-oversize` で実際に stderr へ警告が出ること」の end-to-end 検証を含めること。
   - 注意: `warn` に**型付き nil**(例 `var w *bytes.Buffer` を `io.Writer` として渡す)を与え、かつ実際に超過レコードが存在すると `transform.go` の `fmt.Fprintf` で panic する。5.1 が渡すのは `os.Stderr`(非 nil 具象値)なので到達経路はない。
-- **タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**(要件 9.4 / NFR-05、タスク 2.2)。未配線でもコンパイル・静的解析・テストのいずれも失敗しない(Go では未使用の定数はエラーにならず、テストが参照しているため未使用検出にもかからない)。4.1 に「`--help` 出力が `dedupeMemoryNote` を含むこと」を検証するテストを課すこと。あわせて「`--dedupe-key` の指定位置が存在しないレコードは重複排除の対象外として常に出力される」旨もヘルプに 1 行記載することが望ましい。
+- ~~**タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**~~ — **タスク 4.1 で配線済み**(`version.go` の `usageText()` 末尾)。`TestUsageTextContainsDedupeMemoryNote` が固定し、埋め込みを外す変異でテストが落ちることをレビューが実測。`--dedupe-key` の位置が存在しないレコードを常に出力する旨もヘルプに記載済み(`TestUsageTextDocumentsDedupeMissingPosition`)。
+- **【重要・タスク 5.1 が必ず読むこと】`parseArgs` の番兵エラーを表示へ結線すること**(タスク 4.1)。`parseArgs` は `--version` / `--help` を表示も `os.Exit` もせずに `errShowVersion` / `errShowHelp` を返すだけで(IMPL-19/IMPL-20 に従い表示先と終了コードは main の責務)、**要件 7.5 / 7.6 の「表示して終了コード 0」は 5.1 が結線してはじめて満たされる**。5.1 は `errors.Is(err, errShowVersion)` → `versionLine()` を stdout へ、`errors.Is(err, errShowHelp)` → `usageText()` を stdout へ書き、いずれも終了コード 0 を返すこと(番兵は `*ExitError` ではないため、`errors.As(*ExitError)` の経路に載せると引数不正の 1 になる)。
+  - **未配線でもコンパイル・`go vet`・`staticcheck`・`go test` のいずれも失敗しない**。`usageText()` は本番コードから 1 箇所も参照されておらず(参照は `cli_test.go` のみ)、Go は未使用関数をエラーにせず、テストが参照するため未使用検出にもかからない。レビューで実測確認済み。
+  - 5.1 の完了条件に「`--version` / `--help` を渡した `run()` が stdout へ該当文言を書き、終了コード 0 を返すこと」の end-to-end テストを課すこと(現時点で `run()` を呼ぶテストは 1 本も存在しない)。
 - ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
 - **タスク 3.3 は `output_test.go` の `TestOpenOutputAppendModeIsNotWiredYet` を、追記モードの本来のテストへ置き換えること**(タスク 3.2)。これは追記の継ぎ目が未実装であることを固定する「見張り番」テストで、3.3 が追記を実装した時点で失敗する(それが意図)。現状この指示は `output_test.go` のコメントにしかなく、3.3 の担当者が先に読む保証がないためここに記録する。なお未結線の継ぎ目は終了コード **9(`ExitInternal`)** を返す設計とした(4 を返すと未実装経路が「環境側の失敗=リトライ・調査対象」を装い、呼び出し元の切り分けを誤らせるため)。
 - **【重要・タスク 3.4 が必ず読むこと】追記先のハンドルに `os.O_APPEND` を付けてはならない。付けると Windows で `File.Truncate` が必ず失敗する**(タスク 3.3 のレビューで発見、コントローラが Go のソースで裏取り済み)。`syscall.Open`(`syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `GENERIC_WRITE` を落とし、「`GENERIC_WRITE` が与える権利のうち **`FILE_WRITE_DATA` を除く**すべて」を付け直す(Go 自身のコメント)。一方 `os.File.Truncate` → `syscall.Ftruncate`(同 `:651-659`)は `setFileInformationByHandle(FileEndOfFileInfo)` で、これは `FILE_WRITE_DATA` を要求する。Go 自身が「`O_TRUNC` のときは切り詰めのために `GENERIC_WRITE` が要る」と書いているのが決定的な裏付け。
@@ -175,7 +178,20 @@
 - `commitNew` の stale ジャーナル削除失敗は、rename 成功後でも終了コード 4 で報告する。黙認すると「次回の追記が新しいファイルを無関係なサイズへ切り詰める」時限装置を残したまま 0 を返すため(design.md「Risks」がこの扱いを明示的に想定している)。
 - 親ディレクトリの同期は best effort で失敗を報告しない。Windows の `FlushFileBuffers` はディレクトリハンドルを拒否し、NFR-10 によりツールは報告先を持たないため。要件 4.8 の発動条件は電源断ではなくプロセスの強制終了なので、この同期は要件を超えた上積み。
 
+### タスク 4.1 が確定した cli の契約
+
+- `parseArgs(args []string) (*Config, error)` の戻り値は 3 通りに限られる: 検証済み `*Config` / `errShowVersion` `errShowHelp`(番兵、`*ExitError` ではない)/ `*ExitError{Code: ExitUsage}`。**`parseArgs` は stdout にも stderr にも一切書かない**(`flag` は `ContinueOnError` + `SetOutput(io.Discard)` + 空の `Usage` で既定出力を抑止済み)。表示先の選択は main の責務(要件 8.1)。
+- **`--path` の空文字列はルートとして受理し、`--cursor-key` / `--dedupe-key` の空文字列は終了コード 1 で拒否する**(引数ごと省略したときだけ nil)。RFC 6901 では `""` はルートを指す有効な値だが、カーソル・重複排除キーとしてルートは意味を持たず、黙認すると呼び出し元の未設定変数展開(`--cursor-key ""`)が要件 5.4 の正当な「0 件だから last_id なし」と区別できなくなるため。判定は `fs.Visit` で作った `specified` 集合による(値だけでは既定値と区別できない)。
+- **`--max-record-bytes` の明示的な 0 と負値は拒否する**(`Config` 上の 0 は「無制限」の内部表現であり、意図の取り違えを招くため)。`--skip-oversize` の単独指定も拒否する。
+- `--add-field` は最初の `=` で分割する(`a=b=c` はキー `a`・値 `b=c`)。値は空可・キーは空不可・**同一キーの重複指定は拒否**(どちらが勝つか利用者が予測できないため)。レコード側の既存キーとの衝突検出は transform の責務(タスク 2.2)。
+- 入力の整列は `slices.SortFunc` + `cmp.Or` で「ベース名昇順 → 同名時フルパス」。**順序が確定するのはこの 1 箇所だけ**で convert は再整列しない(要件 1.2)。
+- `--version` と `--help` の同時指定は `--version` を優先し、表示要求は他の検証(必須引数の欠落など)より先に判定する。ただし `--version --未知引数` は `flag.Parse` が先に失敗するため終了コード 1 になる(fail-closed)。
+- `--newline` の値は大文字小文字を区別する(`LF` は拒否)。要件 3.3 / 6.7 節の表記が `lf|crlf` のため。
+
 ### 未解決の所見(ブロッキングではない)
+
+- **`--out` が絶対パスであることは誰も検証していない**(タスク 4.1 レビューで実測: `--out relative/out.ndjson` は受理され `Config.Out` にそのまま入る)。design.md の output は Preconditions に「`cfg.Out` は絶対パス」を掲げるが、これを確立するコードは存在しない。要件違反ではない: 絶対パスで渡すのは呼び出し元の義務(`docs/requirements.md` の DS-11)であり、requirements.md の Boundary Context はこれを Adjacent expectations(スコープ外)に置いている。design.md の cli 検証リストにもタスク 4.1 の task text にも絶対パス検査は含まれない。**ただしタスク 3.2 / 5.1 は「cli が絶対パスを保証済み」と仮定してはならない。** 相対パスが渡ると作業ディレクトリ依存になり(NFR-13 と相反)、終了コード 0 のまま意図しない場所へ書き出す。
+- **同一パスの `--in` 重複指定は受理される**(2 回処理され `files=2`、レコードも重複する)。`--add-field` のキー重複は拒否するのに対し非対称だが、`--in` の重複は「2 回処理する」という定義可能な意味を持つ一方、`--add-field` の重複は勝者が定義できないため。意図的な区別。
 
 - **タスク 3.4 で「構造的に検出不能」と申告した変異 3 件のうち 1 件は未テストにすぎない**(レビューが実証)。`commitAppend` のジャーナル削除を `Sync` の**前**へ移す変異は、`prepareAppend` に `/dev/null` を渡すと(Stat=0・Seek 成功・Write 成功・**Sync=EINVAL**)`commitAppend` を直接呼んで「Sync 失敗時にジャーナルが残るか」で区別でき、HEAD で PASS・変異で FAIL することが実測済み。残る 2 件(`writeJournal` の `Sync` 削除、`syncContainingDir` 削除)は、パス経由の `O_CREAT|O_EXCL` が必ず通常ファイルを返す以上シームなしには観測不能で、申告どおり真にテスト不能。
 - **復旧を `tryLock` より前へ移す変異は検出できない**(タスク 3.4)。非 Windows の `tryLock` が no-op であるため。実装の欠陥ではないが、この環境では機械的に固定できない不変条件として記録する。
