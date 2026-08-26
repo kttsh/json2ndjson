@@ -37,7 +37,7 @@
   - _Requirements: 3.7, 3.8, 3.9, 10.2_
 
 - [ ] 3. ファイルドメイン
-- [ ] 3.1 (P) OS 別の排他ロック
+- [x] 3.1 (P) OS 別の排他ロック
   - Windows では排他・非ブロッキングのファイルロックを取得し、ロック済みなら専用エラーを返す。非 Windows では常に成功する no-op 実装をビルドタグで分離する
   - 完了条件: 非 Windows でビルドとテストが通り、Windows 向けクロスコンパイルが成功する
   - _Requirements: 4.6_
@@ -112,7 +112,7 @@
 - **Go 1.27 は本環境で取得できない**(タスク 1)。ツールチェーンの配布元(`storage.googleapis.com`)と代替 module proxy がいずれも組織のエグレスポリシーで 403。`sum.golang.org` も同様のため `GOSUMDB=off` が必要。再試行しないこと。
 - **代替ツールチェーン**: `go` は Go 1.25.1(`/usr/local/go1.25.1`)。`go env -w` で `GOEXPERIMENT=jsonv2` / `GOSUMDB=off` / `GOTOOLCHAIN=local` を設定済み。`encoding/json/jsontext` は design.md が要求する API(`ReadValue`・`ReadToken`・`StackDepth`・`Value.Compact`・`AllowInvalidUTF8`・`AllowDuplicateNames`・`PreserveRawStrings`)を同一 import パスで提供し、数値字句と UTF-8 サロゲートの保持も実測確認済み。
 - **go.mod の逸脱**: design.md の「Go 1.27 系を固定」に対し `go 1.25.1` のみを宣言し `toolchain` ディレクティブを置かない。`go` ディレクティブは下限指定のため無改変で Go 1.27 でもビルドできる(1.27 では GOEXPERIMENT 不要)。タスク 6.2 で Go 1.27 が使える環境なら design.md どおりに戻す判断が必要。
-- **`golang.org/x/sys` の require はタスク 3.1 で追加する**(タスク 1)。import するソース(`lock_windows.go`)が存在しない状態で require を書くと `go mod tidy` が即座に除去して go.mod を書き換えるため。v0.47.0 はローカル module cache に取得済み。
+- ~~**`golang.org/x/sys` の require はタスク 3.1 で追加する**~~ — **タスク 3.1 で追加済み**(v0.47.0、module cache から解決・ネットワーク未使用)。`go mod tidy` が Windows 限定 import でも直接依存として保持することを実測確認済み(冪等)。`go mod verify` = all modules verified。以後もサードパーティはこの 1 件のみ(IMPL-02)。
 - **`staticcheck` は `/root/go/bin/staticcheck`(2026.1 / v0.7.0)**。最新版は Go 1.26 以上を要求するため v0.7.0 を採用。`staticcheck ./...` を正準検証コマンドに含めること(タスク 1 では SA4023 の自己証明的テストを検出した)。
 - **`go build ./...` はリポジトリ直下に実行ファイル `json2ndjson` を生成する**。`.gitignore` に登録済み。
 - **正準検証コマンド**: `gofmt -l .`(出力空)/ `go vet ./...` / `/root/go/bin/staticcheck ./...` / `go test ./...` / `go build ./...` / `GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o <out>.exe .`
@@ -127,13 +127,23 @@
   - 注意: `warn` に**型付き nil**(例 `var w *bytes.Buffer` を `io.Writer` として渡す)を与え、かつ実際に超過レコードが存在すると `transform.go` の `fmt.Fprintf` で panic する。5.1 が渡すのは `os.Stderr`(非 nil 具象値)なので到達経路はない。
 - **タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**(要件 9.4 / NFR-05、タスク 2.2)。未配線でもコンパイル・静的解析・テストのいずれも失敗しない(Go では未使用の定数はエラーにならず、テストが参照しているため未使用検出にもかからない)。4.1 に「`--help` 出力が `dedupeMemoryNote` を含むこと」を検証するテストを課すこと。あわせて「`--dedupe-key` の指定位置が存在しないレコードは重複排除の対象外として常に出力される」旨もヘルプに 1 行記載することが望ましい。
 - ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
+- **タスク 3.3 は追記モードの出力ファイルを `os.O_RDWR|os.O_APPEND|os.O_CREATE` で開くこと。`os.O_WRONLY|os.O_APPEND` は Windows 実機でのみ排他が壊れる**(タスク 3.1 のレビューで発見、コントローラが Go のソースで裏取り済み)。理由: `syscall.Open`(`/usr/local/go1.25.1/src/syscall/syscall_windows.go:386-395`)は `O_APPEND` かつ `O_TRUNC` なしのとき `access &^= GENERIC_WRITE` を行う。`O_WRONLY|O_APPEND|O_CREATE` では GENERIC_READ も GENERIC_WRITE も残らず、`LockFileEx` が要求する「GENERIC_READ または GENERIC_WRITE で開かれたハンドル」を満たさないため `tryLock` が `ERROR_ACCESS_DENIED` を返す。この値は `ErrLocked` へ写像されず `default:` 分岐で素通しされるので、**要件 4.6 の排他が無言で機能しなくなる**。`O_RDWR|O_APPEND` なら GENERIC_READ が残り成立する(末尾 1 バイトを読む必要からも読み取り権限は必要)。Linux では no-op のため**コンパイル・静的解析・テストのいずれでも検出できない**。
+- **タスク 3.2 / 3.3 は Linux 上で「同時実行 → 終了コード 4」を検証できない**(タスク 3.1)。非 Windows の `tryLock` は no-op で、同一パスの 2 本のハンドルが両方ロックに成功する(`TestTryLockIsNoOpOnNonWindows` が明示的に固定)。design.md の `output_test.go` 行と「Validation: 同時実行」はこの環境では充足不能。排他テストは `runtime.GOOS != "windows"` で Skip するか Windows 受け入れテストへ委譲し、**3.2/3.3 は「要件 4.6 を検証済み」と主張してはならない**。
 - **タスク 3.2 / 3.3 は `RecordSink.WriteRecord` が受け取る `compact` を呼び出しを越えて保持してはならない**(タスク 2.3)。convert はレコードバッファを再利用するため、呼び出し後に内容が書き換わる(実測確認済み)。`bufio.Writer` へ即時に書き出す実装なら制約に抵触しない。保持する必要がある実装は自分で写しを取ること。この寿命契約は design.md には無く、`convert.go` の `RecordSink` インターフェースの doc コメントに記載されている。
 
 ### design.md との乖離(仕様保守側の判断待ち。コードは意図的にこの状態)
 
 - **`runConversion` の署名**: design.md の convert Service Interface(「Components and Interfaces → convert」)は `func runConversion(cfg *Config, sink RecordSink) (*ConvertResult, error)` の 2 引数形を掲載しているが、実装は `func runConversion(cfg *Config, sink RecordSink, warn io.Writer) (*ConvertResult, error)` の 3 引数形。理由: 要件 6.6 の警告先(stderr)は main が所有し、2 引数形では convert が警告先を得られず、要件 6.6 が**無言で満たせなくなる**(レビューが実行で実証)。逸脱理由は `convert.go` の `runConversion` の doc コメントに恒久記録済み。承認済み design を無断編集しない方針のため design.md 側は未変更。**design を 3 引数形へ同期するかは人間の判断事項。**
 
+### タスク 3.1 が確定した lock の契約
+
+- `tryLock(f *os.File) error` / `unlock(f *os.File) error`。`tryLock` は**素の `ErrLocked`**(`lock.go` に単一宣言)を返し、終了コード 4(`ExitOutput`)への写像は呼び出し側 output の責務。`errors.Is(err, ErrLocked)` で判別し、パス名を添えて `%w` で包んでよい(包んでも `errors.Is` が通ることをテストで固定済み)。
+- Windows 実装は `LockFileEx` を `LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY` で呼ぶ非ブロッキング。競合を示す `ERROR_LOCK_VIOLATION` / `ERROR_IO_PENDING` のみを `ErrLocked` に写像し、他は素通しする。
+- **`lock_windows.go` の意味論は機械的検証が一切効かない**。範囲不一致・`LOCKFILE_FAIL_IMMEDIATELY` の除去・`reserved=1` のいずれも Linux テスト・`GOOS=windows go vet`・`GOOS=windows staticcheck` をすべて通過することが実測されている。編集する場合は x/sys 実ソース・MSDN・Go ツールチェーン自身の `cmd/go/internal/lockedfile/internal/filelock/filelock_windows.go` との読み合わせが必須。
+
 ### 未解決の所見(ブロッキングではない)
+
+- **design.md「File Structure Plan」が `lock.go` / `lock_test.go` を列挙していない**(タスク 3.1)。`_Boundary: lock_` は両ファイルを許可しているため逸脱ではないが、design.md 側が軽微に陳腐化している。
 
 - **`--max-record-bytes` 超過の終了コード 5 メッセージに位置情報がない**(タスク 2.2/2.3)。`--path` 由来の終了コード 5 はファイル名・バイトオフセット・JSON Pointer を持つが、サイズ超過由来のものは持たない(`convert.go` が `Apply` のエラーを装飾せず返すため)。要件 1.6 が位置情報を要求しているのは構文エラー(終了コード 3)であり要件違反ではないが、運用時の切り分けやすさとしてはタスク 5.1 で装飾を検討する価値がある。
 
