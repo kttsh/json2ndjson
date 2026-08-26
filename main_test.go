@@ -2,18 +2,31 @@ package main
 
 import (
 	"bytes"
+	"go/parser"
+	"go/token"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
-// main_test.go はタスク 5.1 が結線した実行フロー(run)を、引数から
-// 終了コード・標準出力・標準エラー出力・出力ファイルの状態まで一気通貫で検証する
+// main_test.go は実行フロー(run)を、引数から終了コード・標準出力・標準エラー出力・
+// 出力ファイルの状態まで一気通貫で検証する
 // (design.md「Testing Strategy / Integration Tests 5. E2E(run 関数)」)。
 //
-// 終了コード体系の網羅的な E2E マトリクスと運用制約(日本語・空白パス、冪等性)は
-// タスク 5.2 の責務であり、ここでは 5.1 の完了条件に対応する観点だけを固定する。
+// 収録している観点は 2 つの軸に分かれる。
+//   - タスク 5.1(前半): 結線の観点。原因ごとに 1 ケースを置き、フローの各段
+//     (番兵の表示要求、警告の宛先、defer による復元、panic 回復、確定の順序)を固定する
+//   - タスク 5.2(後半、「タスク 5.2」の見出し以降): 終了コードの観点。6.8 節の
+//     全コード(0〜5, 9)を 1 つの表で再現し、あわせて運用制約(空白・日本語パス、
+//     冪等性、ネットワーク非依存)を検証する
+//
+// 同じ終了コードが両方に現れることがあるが、前者は「どの原因がその経路を通るか」、
+// 後者は「体系のすべてのコードが再現できるか」を固定しており、軸が異なる。
 
 // runCLI は run を呼び、終了コードと両ストリームの内容を返す。
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
@@ -676,4 +689,467 @@ func TestRunResultLineIsLFTerminatedRegardlessOfNewlineOption(t *testing.T) {
 	if want := "{\"id\":1}\r\n"; string(got) != want {
 		t.Errorf("出力ファイル = %q, want %q", got, want)
 	}
+}
+
+// =============================================================================
+// タスク 5.2: 終了コードマトリクスと運用制約
+// =============================================================================
+
+// TestExitCodeMatrix は要件 7.4(6.8 節)の終了コード体系のすべての値を
+// 実際の実行で再現する。呼び出し元(DataSpider スクリプト)はこの値だけで
+// 失敗理由を分岐するため、体系のどのコードも「到達できること」自体が契約である。
+//
+// 各ケースは終了コードだけでなく、標準出力と標準エラー出力の規律
+// (要件 8.1 / 8.2)も同時に固定する。異常系で標準出力に何かが出れば、
+// 呼び出し元の結果行の解析が壊れるためである。
+func TestExitCodeMatrix(t *testing.T) {
+	tests := []struct {
+		name string
+		// setup は入力を用意し、run へ渡す引数を返す。
+		setup func(t *testing.T, dir string) []string
+		// panicStderr が true のとき標準エラー出力を panicOnceWriter に差し替え、
+		// 予期しない内部エラー(終了コード 9)を再現する。--skip-oversize の
+		// 警告の書き出しで panic させることで、変換の途中から回復する経路を通す。
+		panicStderr bool
+		wantCode    int
+		// wantStdout は標準出力の期待値。空文字列は「1 バイトも書かないこと」。
+		wantStdout string
+		// wantSilentStderr が true のとき標準エラー出力が空であることを要求する。
+		// false のときは「空でないこと」を要求する。
+		wantSilentStderr bool
+	}{
+		{
+			name: "0 正常終了",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `[{"id":1},{"id":2}]`)
+				return []string{"--in", in, "--out", filepath.Join(dir, "out.ndjson")}
+			},
+			wantCode:         ExitOK,
+			wantStdout:       "records=2 files=1\n",
+			wantSilentStderr: true,
+		},
+		{
+			name: "1 引数不正",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `[]`)
+				// --append と --overwrite は排他(要件 7.3 / FR-37)。
+				return []string{"--in", in, "--out", filepath.Join(dir, "out.ndjson"), "--append", "--overwrite"}
+			},
+			wantCode: ExitUsage,
+		},
+		{
+			name: "2 入力ファイル不可",
+			setup: func(t *testing.T, dir string) []string {
+				return []string{"--in", filepath.Join(dir, "存在しない.json"), "--out", filepath.Join(dir, "out.ndjson")}
+			},
+			wantCode: ExitInput,
+		},
+		{
+			name: "3 JSON 構文エラー",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `[{"id":1},{`)
+				return []string{"--in", in, "--out", filepath.Join(dir, "out.ndjson")}
+			},
+			wantCode: ExitSyntax,
+		},
+		{
+			name: "4 出力書き込みエラー",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `[{"id":1}]`)
+				// 既存の出力ファイルがあり --overwrite がない(要件 4.7 / FR-26)。
+				out := writeFile(t, dir, "out.ndjson", "既存の内容\n")
+				return []string{"--in", in, "--out", out}
+			},
+			wantCode: ExitOutput,
+		},
+		{
+			name: "5 位置不正",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `{"data":"配列でもオブジェクトでもない"}`)
+				return []string{"--in", in, "--out", filepath.Join(dir, "out.ndjson"), "--path", "/data"}
+			},
+			wantCode: ExitLocation,
+		},
+		{
+			name: "9 予期しない内部エラー",
+			setup: func(t *testing.T, dir string) []string {
+				in := writeFile(t, dir, "in.json", `[{"id":1,"pad":"0123456789"}]`)
+				return []string{
+					"--in", in, "--out", filepath.Join(dir, "out.ndjson"),
+					"--max-record-bytes", "8", "--skip-oversize",
+				}
+			},
+			panicStderr: true,
+			wantCode:    ExitInternal,
+		},
+	}
+
+	// 体系のすべてのコードが表に現れていることを、表そのものから確かめる。
+	// ケースを消したり書き換えたりすると、マトリクスとしての網羅性が静かに失われるため。
+	covered := map[int]bool{}
+	for _, tt := range tests {
+		covered[tt.wantCode] = true
+	}
+	for _, code := range []int{ExitOK, ExitUsage, ExitInput, ExitSyntax, ExitOutput, ExitLocation, ExitInternal} {
+		if !covered[code] {
+			t.Errorf("終了コード %d を再現するケースが表にありません(要件 7.4)", code)
+		}
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			args := tt.setup(t, dir)
+
+			var stdout bytes.Buffer
+			var plainStderr bytes.Buffer
+			var stderr io.Writer = &plainStderr
+			var panicked *panicOnceWriter
+			if tt.panicStderr {
+				panicked = &panicOnceWriter{}
+				stderr = panicked
+			}
+
+			code := run(args, &stdout, stderr)
+
+			stderrText := plainStderr.String()
+			if panicked != nil {
+				if !panicked.panicked {
+					t.Fatal("意図した panic 経路に到達していません")
+				}
+				stderrText = panicked.buf.String()
+			}
+
+			if code != tt.wantCode {
+				t.Errorf("終了コード = %d, want %d (stderr=%q)", code, tt.wantCode, stderrText)
+			}
+			got := stdout.String()
+			if got != tt.wantStdout {
+				t.Errorf("stdout = %q, want %q", got, tt.wantStdout)
+			}
+			// 標準出力は終了コードによらず ASCII の範囲に収める(要件 5.6 / 8.3)。
+			for i := range len(got) {
+				if b := got[i]; b > 0x7e {
+					t.Errorf("stdout の %d バイト目が ASCII の範囲外(0x%02x)です: %q", i+1, b, got)
+					break
+				}
+			}
+			if tt.wantSilentStderr {
+				if stderrText != "" {
+					t.Errorf("正常終了では stderr へ何も書かない(要件 8.2)。stderr = %q", stderrText)
+				}
+				return
+			}
+			if stderrText == "" {
+				t.Error("異常終了では stderr へ人間向けメッセージを書く(要件 8.2)")
+			}
+			// 標準エラー出力は UTF-8 の人間向けメッセージ(要件 8.3 / FR-42)。
+			// Go のソース文字列は元より UTF-8 なのでほぼ自明だが、日本語 Windows 環境向けの
+			// ツールでは「コンソールに合わせて Shift_JIS へ変換する」改変が現実的にありうる。
+			// この検査はその退行を捕まえるために置いている。
+			if !utf8.ValidString(stderrText) {
+				t.Errorf("stderr が UTF-8 として不正です: %q", stderrText)
+			}
+		})
+	}
+}
+
+// TestRunHandlesSpaceAndJapanesePaths は空白と日本語を含む絶対パスでの入出力を検証する
+// (要件 4.1 / FR-20)。DataSpider の運用では出力先が日本語のディレクトリになりうる。
+func TestRunHandlesSpaceAndJapanesePaths(t *testing.T) {
+	root := t.TempDir()
+	inDir := filepath.Join(root, "入力 ディレクトリ")
+	outDir := filepath.Join(root, "出力 用 フォルダ")
+	for _, d := range []string{inDir, outDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("テスト用ディレクトリ %q を作成できません: %v", d, err)
+		}
+	}
+
+	in := writeFile(t, inDir, "テスト 入力 データ.json", `{"データ":[{"id":"あ1"},{"id":"あ2"}]}`)
+	out := filepath.Join(outDir, "結果 出力.ndjson")
+
+	// 要件 4.1 が定めるのは絶対パスでの受け付け。前提が崩れていないことを明示する。
+	if !filepath.IsAbs(in) || !filepath.IsAbs(out) {
+		t.Fatalf("テストの前提が壊れています(絶対パスではない): in=%q out=%q", in, out)
+	}
+
+	// --cursor-key の値は ASCII に収める必要がある(要件 5.6)ため、
+	// 結果行に載せない形で日本語の値を通す。
+	code, stdout, stderr := runCLI(t, "--in", in, "--out", out, "--path", "/データ")
+	if code != ExitOK {
+		t.Fatalf("終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
+	}
+	if want := "records=2 files=1\n"; stdout != want {
+		t.Errorf("stdout = %q, want %q", stdout, want)
+	}
+
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("出力ファイルを読めません: %v", err)
+	}
+	// 日本語のキーと値は UTF-8 のまま出力する(要件 3.4 / 3.9)。
+	if want := "{\"id\":\"あ1\"}\n{\"id\":\"あ2\"}\n"; string(got) != want {
+		t.Errorf("出力ファイル = %q, want %q", got, want)
+	}
+
+	// 追記モードでも同じパスを扱えること(要件 4.3)。
+	code, stdout, stderr = runCLI(t, "--in", in, "--out", out, "--path", "/データ", "--append")
+	if code != ExitOK {
+		t.Fatalf("追記の終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
+	}
+	if want := "records=2 files=1\n"; stdout != want {
+		t.Errorf("追記の stdout = %q, want %q", stdout, want)
+	}
+	got, err = os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("出力ファイルを読めません: %v", err)
+	}
+	if want := strings.Repeat("{\"id\":\"あ1\"}\n{\"id\":\"あ2\"}\n", 2); string(got) != want {
+		t.Errorf("追記後の出力ファイル = %q, want %q", got, want)
+	}
+	assertNoLeftovers(t, outDir, out)
+}
+
+// TestRunIsIdempotent は同じ入力に対する再実行が同じ出力を生むことを検証する
+// (要件 10.1 / NFR-06)。呼び出し元は失敗時にそのまま再実行するため、
+// 実行ごとに結果が変わると復旧手順が成立しない。
+//
+// 対象は新規作成モード。追記モードは「既存の末尾に足す」ことが仕様であり
+// (要件 4.3)、再実行で内容が増えるのは冪等性の違反ではない。
+//
+// 整形オプションを一通り有効にして実行する。再エンコード経路(キー置換・固定値追加)や
+// 重複排除の集合を通るため、マップの反復順のような非決定性が紛れ込めばここで露見する。
+func TestRunIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	in := writeFile(t, dir, "in.json", `{"data":[
+		{"user-id":"u1","tag-name":"a","nest":{"inner-key":[1,2,{"deep-key":true}]}},
+		{"user-id":"u2","tag-name":"b","nest":{"inner-key":[]}},
+		{"user-id":"u1","tag-name":"重複により落ちる"},
+		{"user-id":"u3","pad":"上限を超えるのでスキップされる長い値です上限を超えるのでスキップされる長い値です"}
+	]}`)
+	out := filepath.Join(dir, "out.ndjson")
+
+	args := []string{
+		"--in", in, "--out", out, "--overwrite",
+		"--path", "/data",
+		// カーソル値も重複排除キーも整形「後」のレコードから解決されるため、
+		// --key-hyphen-to-underscore を有効にした場合は置換後のキー名で指定する
+		// (整形の適用順序は「キー名置換 → 固定値追加 → サイズ上限 → 重複排除」)。
+		"--cursor-key", "/user_id",
+		"--dedupe-key", "/user_id",
+		"--key-hyphen-to-underscore",
+		"--add-field", "source=api",
+		"--add-field", "batch=001",
+		"--newline", "crlf",
+		// 整形後のサイズは 1 件目 105 / 2 件目 84 / 4 件目 174 バイト。
+		// 110 は前 2 件を通し 4 件目だけを落とす値で、両側に余裕がある。
+		"--max-record-bytes", "110",
+		"--skip-oversize",
+	}
+
+	type observation struct {
+		code    int
+		stdout  string
+		stderr  string
+		content string
+	}
+	var runs []observation
+	for range 3 {
+		code, stdout, stderr := runCLI(t, args...)
+		content, err := os.ReadFile(out)
+		if err != nil {
+			t.Fatalf("出力ファイルを読めません: %v", err)
+		}
+		runs = append(runs, observation{code, stdout, stderr, string(content)})
+	}
+
+	first := runs[0]
+	if first.code != ExitOK {
+		t.Fatalf("終了コード = %d, want %d (stderr=%q)", first.code, ExitOK, first.stderr)
+	}
+	// 重複 1 件と上限超過 1 件が落ちるため、出力は 2 件。
+	if want := "records=2 files=1 last_id=u2\n"; first.stdout != want {
+		t.Errorf("stdout = %q, want %q", first.stdout, want)
+	}
+	// 整形が実際に効いていることを確かめる。効いていない出力を 3 回比べても
+	// 冪等性の証明にはならないため、内容そのものをここで固定する。
+	wantContent := `{"user_id":"u1","tag_name":"a","nest":{"inner_key":[1,2,{"deep_key":true}]},"source":"api","batch":"001"}` + "\r\n" +
+		`{"user_id":"u2","tag_name":"b","nest":{"inner_key":[]},"source":"api","batch":"001"}` + "\r\n"
+	if first.content != wantContent {
+		t.Errorf("出力ファイル = %q\nwant %q", first.content, wantContent)
+	}
+	if !strings.Contains(first.stderr, "--max-record-bytes") {
+		t.Errorf("上限超過のスキップ警告が出ていません。stderr = %q", first.stderr)
+	}
+
+	for i, r := range runs[1:] {
+		n := i + 2
+		if r.code != first.code {
+			t.Errorf("%d 回目の終了コード = %d, want %d(1 回目と同じであること)", n, r.code, first.code)
+		}
+		if r.stdout != first.stdout {
+			t.Errorf("%d 回目の stdout = %q, want %q(1 回目と同じであること)", n, r.stdout, first.stdout)
+		}
+		if r.stderr != first.stderr {
+			t.Errorf("%d 回目の stderr = %q, want %q(1 回目と同じであること)", n, r.stderr, first.stderr)
+		}
+		if r.content != first.content {
+			t.Errorf("%d 回目の出力ファイルが 1 回目と異なります(要件 10.1)\n got %q\nwant %q", n, r.content, first.content)
+		}
+	}
+	assertNoLeftovers(t, dir, out)
+}
+
+// TestRunRetryAfterFailureMatchesCleanRun は「失敗 → 復元 → 再実行」の結果が
+// 一度も失敗しなかった実行の結果と一致することを検証する(要件 10.1 / NFR-06)。
+//
+// 要件 10 の目的は「障害時のリトライと原因調査を安心して行える」ことであり、
+// 冪等性が意味を持つのはまさにこの経路である。失敗した実行がロールバックしても
+// 副作用(部分的な行、残ったジャーナル、ずれた開始前サイズ)を残していれば、
+// 再実行の結果は clean run と一致しない。
+func TestRunRetryAfterFailureMatchesCleanRun(t *testing.T) {
+	const seed = "{\"id\":0}\n"
+	good := `[{"id":1},{"id":2}]`
+	broken := `[{"id":`
+
+	// 対照群: 一度も失敗せず、良い入力だけを追記する。
+	controlDir := t.TempDir()
+	controlIn := writeFile(t, controlDir, "a.json", good)
+	controlOut := writeFile(t, controlDir, "out.ndjson", seed)
+	code, wantStdout, stderr := runCLI(t, "--in", controlIn, "--out", controlOut, "--append", "--cursor-key", "/id")
+	if code != ExitOK {
+		t.Fatalf("対照群の終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
+	}
+	wantContent, err := os.ReadFile(controlOut)
+	if err != nil {
+		t.Fatalf("対照群の出力を読めません: %v", err)
+	}
+
+	// 試験群: まず壊れた入力を含めて失敗させ、復元後に良い入力だけで再実行する。
+	dir := t.TempDir()
+	in := writeFile(t, dir, "a.json", good)
+	bad := writeFile(t, dir, "b.json", broken)
+	out := writeFile(t, dir, "out.ndjson", seed)
+
+	code, stdout, stderr := runCLI(t, "--in", in, "--in", bad, "--out", out, "--append", "--cursor-key", "/id")
+	if code != ExitSyntax {
+		t.Fatalf("1 回目(失敗させる実行)の終了コード = %d, want %d (stderr=%q)", code, ExitSyntax, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("失敗した実行が標準出力へ書いています: %q", stdout)
+	}
+	// 失敗の直後は追記開始前の状態に戻っていること(要件 4.9)。
+	if got, err := os.ReadFile(out); err != nil {
+		t.Fatalf("出力ファイルを読めません: %v", err)
+	} else if string(got) != seed {
+		t.Fatalf("失敗後の出力 = %q, want %q", got, seed)
+	}
+	assertNoLeftovers(t, dir, out)
+
+	// リトライ。壊れた入力を取り除いた以外は対照群と同じ実行になる。
+	code, stdout, stderr = runCLI(t, "--in", in, "--out", out, "--append", "--cursor-key", "/id")
+	if code != ExitOK {
+		t.Fatalf("リトライの終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
+	}
+	if stdout != wantStdout {
+		t.Errorf("リトライの結果行 = %q, want %q(一度も失敗しなかった実行と同じであること)", stdout, wantStdout)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("出力ファイルを読めません: %v", err)
+	}
+	if string(got) != string(wantContent) {
+		t.Errorf("リトライ後の出力 = %q\nwant %q(一度も失敗しなかった実行と同じであること。要件 10.1)", got, wantContent)
+	}
+	assertNoLeftovers(t, dir, out)
+}
+
+// TestNoNetworkPackagesInSource はパッケージ自身のソースがネットワーク系の
+// パッケージを import していないことを検証する(要件 11.3 / NFR-12)。
+//
+// go ツールチェーンを必要としないため常に実行される。ビルドタグで分離された
+// ファイル(lock_windows.go など)も含めて全ソースを走査する。
+func TestNoNetworkPackagesInSource(t *testing.T) {
+	// ファイルを 1 つずつ解析する(go/parser の ParseDir はビルドタグを考慮しないと
+	// して非推奨。ここでは逆にタグを無視して全ファイルを見たいので、意図を
+	// そのまま書き下すほうが正確である)。
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("ソースファイルを列挙できません: %v", err)
+	}
+
+	fset := token.NewFileSet()
+	checked := 0
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, parser.ImportsOnly)
+		if err != nil {
+			t.Fatalf("%s を解析できません: %v", name, err)
+		}
+		checked++
+		for _, spec := range file.Imports {
+			path, err := strconv.Unquote(spec.Path.Value)
+			if err != nil {
+				t.Fatalf("%s: import パスを解釈できません: %v", name, err)
+			}
+			if isNetworkPackage(path) {
+				t.Errorf("%s がネットワーク系パッケージ %q を import しています(要件 11.3)", name, path)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("走査したファイルが 0 件です(テストの前提が壊れています)")
+	}
+	t.Logf("走査したソースファイル数: %d", checked)
+}
+
+// TestNoNetworkPackagesInDependencies は推移的な依存も含めてネットワーク系の
+// パッケージに到達しないことを検証する(要件 11.3 / NFR-12)。
+//
+// 自身の import だけを見ても、依存先がネットワークを引き込む可能性は排除できない。
+// go list が唯一の正確な情報源のため、ツールチェーンを呼び出す。
+func TestNoNetworkPackagesInDependencies(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		// 事前ビルド済みのテストバイナリを単体で走らせた場合にのみ起こる。
+		// ソース側の検査(TestNoNetworkPackagesInSource)は常に実行される。
+		t.Skipf("go ツールチェーンが見つからないため推移的依存の検査を省略します: %v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), goBin, "list", "-deps", ".")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("go list -deps に失敗しました: %v\nstderr: %s", err, stderr.String())
+	}
+
+	deps := strings.Fields(string(out))
+	if len(deps) == 0 {
+		t.Fatal("依存パッケージが 0 件です(テストの前提が壊れています)")
+	}
+	for _, dep := range deps {
+		if isNetworkPackage(dep) {
+			t.Errorf("推移的な依存にネットワーク系パッケージ %q が含まれます(要件 11.3)", dep)
+		}
+	}
+	t.Logf("検査した依存パッケージ数: %d", len(deps))
+}
+
+// isNetworkPackage は import パスがネットワーク系かどうかを返す。
+//
+// design.md「Security Considerations」の「net 系パッケージを import しない」に従い、
+// net ツリー全体を対象とする。net/url のようにそれ自体は通信しないものも含めるのは、
+// ファイルからファイルへ変換する本ツールに URL を扱う理由がなく、
+// 例外を設けると判定が主観的になるため。
+func isNetworkPackage(importPath string) bool {
+	for _, banned := range []string{"net", "crypto/tls", "golang.org/x/net"} {
+		if importPath == banned || strings.HasPrefix(importPath, banned+"/") {
+			return true
+		}
+	}
+	return false
 }
