@@ -22,7 +22,7 @@
   - 完了条件: 整形機能の単独・組み合わせ(置換+追加+重複排除)のテーブル駆動テストがすべて成功する
   - _Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 6.6, 5.3, 5.5, 9.4_
 
-- [ ] 2.3 ストリーミング変換コア
+- [x] 2.3 ストリーミング変換コア
   - BOM の読み飛ばし、複数入力ファイルの順次処理、JSON Pointer 位置への移動(移動中の深さ監視)、対象が配列・オブジェクト・それ以外(位置不正)の判定を実装する
   - 配列要素を 1 件ずつ生の値として取り出し、コンパクト化した生バイト列を書き込み境界(RecordSink)へ渡す。値・数値・エスケープの字句を一切変換しない
   - レコード内部のネスト深さ上限 512 を検証済み生バイトの線形走査で判定し、超過は構文エラー扱いにする
@@ -123,9 +123,19 @@
 
 ### 未配線の契約(コンパイル・静的解析・テストのいずれでも検出されない。担当タスクは必ず配線すること)
 
-- **タスク 5.1 は `Pipeline.SetWarnWriter(stderr)` を必ず呼ぶこと**(タスク 2.2)。既定は nil で、`warnOversize` は nil なら黙って return する。呼び忘れても**コンパイルエラーも staticcheck 警告もテスト失敗も起きず、要件 6.6 の警告だけが無言で消える**(スキップ動作自体は影響を受けない)。5.1 の完了条件に「`--max-record-bytes` + `--skip-oversize` で実際に stderr へ警告が出ること」の end-to-end 検証を含めること。
+- ~~**タスク 5.1 は `Pipeline.SetWarnWriter(stderr)` を必ず呼ぶこと**~~ — **タスク 2.3 の是正により解消済み。5.1 は `SetWarnWriter` を知る必要がない。** 変換の入口は `runConversion(cfg *Config, sink RecordSink, warn io.Writer)` の 1 本に統合され、内部で `newPipeline(cfg)` + `SetWarnWriter(warn)` を必ず行う。**タスク 5.1 は `runConversion(cfg, sink, stderr)` を呼ぶこと**(第 3 引数を省くとコンパイルエラーになるため、要件 6.6 の警告が無言で消えることはもう起こらない)。`warn` に nil を渡すと警告は抑止される(panic はしない)。なお 5.1 の完了条件には引き続き「`--max-record-bytes` + `--skip-oversize` で実際に stderr へ警告が出ること」の end-to-end 検証を含めること。
+  - 注意: `warn` に**型付き nil**(例 `var w *bytes.Buffer` を `io.Writer` として渡す)を与え、かつ実際に超過レコードが存在すると `transform.go` の `fmt.Fprintf` で panic する。5.1 が渡すのは `os.Stderr`(非 nil 具象値)なので到達経路はない。
 - **タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**(要件 9.4 / NFR-05、タスク 2.2)。未配線でもコンパイル・静的解析・テストのいずれも失敗しない(Go では未使用の定数はエラーにならず、テストが参照しているため未使用検出にもかからない)。4.1 に「`--help` 出力が `dedupeMemoryNote` を含むこと」を検証するテストを課すこと。あわせて「`--dedupe-key` の指定位置が存在しないレコードは重複排除の対象外として常に出力される」旨もヘルプに 1 行記載することが望ましい。
-- **タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**(タスク 2.2)。整形オプションが 1 つも有効でない素通し経路では `Apply` は**入力スライス自体**(同一バッキング配列)を返すため、convert が読み取りバッファを再利用すると保持済みの値が書き換わる。design.md も `LastValue` を「最終レコードの**写し**」と定めている。`Clone` した写しを保持すること。
+- ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
+- **タスク 3.2 / 3.3 は `RecordSink.WriteRecord` が受け取る `compact` を呼び出しを越えて保持してはならない**(タスク 2.3)。convert はレコードバッファを再利用するため、呼び出し後に内容が書き換わる(実測確認済み)。`bufio.Writer` へ即時に書き出す実装なら制約に抵触しない。保持する必要がある実装は自分で写しを取ること。この寿命契約は design.md には無く、`convert.go` の `RecordSink` インターフェースの doc コメントに記載されている。
+
+### design.md との乖離(仕様保守側の判断待ち。コードは意図的にこの状態)
+
+- **`runConversion` の署名**: design.md の convert Service Interface(「Components and Interfaces → convert」)は `func runConversion(cfg *Config, sink RecordSink) (*ConvertResult, error)` の 2 引数形を掲載しているが、実装は `func runConversion(cfg *Config, sink RecordSink, warn io.Writer) (*ConvertResult, error)` の 3 引数形。理由: 要件 6.6 の警告先(stderr)は main が所有し、2 引数形では convert が警告先を得られず、要件 6.6 が**無言で満たせなくなる**(レビューが実行で実証)。逸脱理由は `convert.go` の `runConversion` の doc コメントに恒久記録済み。承認済み design を無断編集しない方針のため design.md 側は未変更。**design を 3 引数形へ同期するかは人間の判断事項。**
+
+### 未解決の所見(ブロッキングではない)
+
+- **`--max-record-bytes` 超過の終了コード 5 メッセージに位置情報がない**(タスク 2.2/2.3)。`--path` 由来の終了コード 5 はファイル名・バイトオフセット・JSON Pointer を持つが、サイズ超過由来のものは持たない(`convert.go` が `Apply` のエラーを装飾せず返すため)。要件 1.6 が位置情報を要求しているのは構文エラー(終了コード 3)であり要件違反ではないが、運用時の切り分けやすさとしてはタスク 5.1 で装飾を検討する価値がある。
 
 ### タスク 2.2 が確定した transform の契約
 
