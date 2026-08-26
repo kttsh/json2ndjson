@@ -2,27 +2,29 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
+	"strconv"
 )
 
 // output は出力ファイルの全ライフサイクル(排他・復旧・書き込み・確定・中断)を
 // 単独で所有するコンポーネント(design.md「output(出力ファイル管理)」)。
 //
-// 【このファイルの実装範囲(タスク 3.2 / 3.3)】
-// 新規作成モード(--append なし、タスク 3.2)と追記モードおよびプロセス内の
-// ロールバック(--append、タスク 3.3)を実装する。ジャーナルによる強制終了後の
-// 復旧(要件 4.8 / NFR-07)はタスク 3.4 の責務であり、その継ぎ目は
-// openAppend(ロック取得の直後)、commitAppend、rollbackAppend に置いてある。
-// ジャーナルのパスと読み書きは、担当タスクが OutputManager へ追加する。
+// 【このファイルの実装範囲(タスク 3.2 / 3.3 / 3.4)】
+// 新規作成モード(--append なし、タスク 3.2)、追記モードおよびプロセス内の
+// ロールバック(--append、タスク 3.3)、ジャーナルによる強制終了後の復旧
+// (要件 4.8 / NFR-07、タスク 3.4)を実装する。
 //
-// タスク 3.3 の範囲でのロールバックは「同一プロセス内の失敗 → 開始前サイズへの
-// 切り詰め」までであり、プロセスごと強制終了された場合の復旧は成立しない
-// (切り詰めを行う主体が消えるため)。それを担保するのがタスク 3.4 のジャーナルである。
+// プロセス内のロールバックは「同一プロセス内の失敗 → 開始前サイズへの切り詰め」で
+// あり、プロセスごと強制終了された場合には成立しない(切り詰めを行う主体が消えるため)。
+// それを担保するのがジャーナルである。追記の 1 バイト目を書く前に開始前サイズを
+// ディスクへ記録しておき、次回起動時に残っていれば記録サイズへ切り詰めてから始める。
 //
 // 【design.md との差異(実装上の必然)】
 // design.md は Finalize の順序を「Flush→Sync→(rename|journal削除)→unlock」と
@@ -44,6 +46,40 @@ import (
 // あることが os.Rename の成立条件)。名前が決定的であることは、同時実行の検出
 // (排他的作成+ロック)と、残骸の stale 判定の前提でもある(design.md「output」)。
 const tempSuffix = ".tmp"
+
+// journalSuffix はジャーナルファイル名の接尾辞(design.md「Data Models /
+// ジャーナルファイル(復旧契約)」の `<出力パス>.journal`)。一時ファイルと同じく
+// 出力名に付けるだけなので、必ず出力ファイルと同一ディレクトリに置かれる
+// (要件 11.4 / NFR-13)。
+//
+// この名前と配置は design.md「Revalidation Triggers」に載る外部契約である
+// (出力ディレクトリの退避・削除手順が影響を受ける)。変更は運用手順の再検証を要する。
+const journalSuffix = ".journal"
+
+// journalPrefix はジャーナル 1 行の接頭辞。内容は `size=<10進数>` + LF の 1 行に
+// 限る(design.md「State Management」: 「ジャーナルは ASCII 1 行」)。
+const journalPrefix = "size="
+
+// journalMaxBytes はジャーナルとして受け付ける最大バイト数。
+// 正規の内容は "size=" + 最大 19 桁(int64 の桁数)+ LF = 25 バイトであり、
+// 余裕を見てもこの値を超えることはない。これを超えるファイルは中身を読むまでもなく
+// ジャーナルの体を成しておらず、読み込み量の上限としても働く
+// (ジャーナルのパスに巨大なファイルが置かれていても全部は読まない)。
+const journalMaxBytes = 64
+
+// journalOpenFlags はジャーナルを作成するときのフラグ。
+//
+// O_EXCL(排他的作成)であることが重要である。ここへ来る時点でジャーナルは
+// 存在しないはずであり(追記の準備は必ず復旧を通る。復旧は残存ジャーナルを削除するか、
+// 解釈できなければ終了コード 4 で停止する)、存在するなら不変条件が破れている。
+// O_TRUNC で黙って上書きすると、「復旧が削除し忘れた」という重大な退行が、
+// ディスク上の最終状態としては正しい実装と区別できなくなる。O_EXCL はそれを
+// 作成の失敗として必ず露見させる(fail-closed)。
+//
+// O_APPEND は付けない。このファイルを Truncate することはないが、Windows で
+// O_APPEND を付けたハンドルが FILE_WRITE_DATA を失う件(appendOpenFlags の注記 (2))と
+// 同じ罠を再現しないための規律である。
+const journalOpenFlags = os.O_WRONLY | os.O_CREATE | os.O_EXCL
 
 // writeBufferSize は出力の書き込みバッファの大きさ(IMPL-15)。
 // write システムコールの回数を減らすためのもので、レコード 1 件がこれを超えても
@@ -253,11 +289,13 @@ func prepareAppend(cfg *Config, f *os.File, tail io.ReaderAt) (*OutputManager, e
 		}
 	}
 
-	// 【継ぎ目】ジャーナル(<出力名>.journal)による強制終了後の復旧(要件 4.8 / NFR-07)は
-	// タスク 3.4 が実装する。その位置はここ、すなわち「ロック取得の直後・開始前サイズの
-	// 記録より前」でなければならない。design.md「フロー上の決定事項」は復旧をロック取得後に
-	// 限ると定めており、また前回の残骸を切り詰める前にサイズを測ると、復旧前の誤った
-	// サイズを開始前サイズとして記録してしまう。
+	// 前回のプロセスが追記中に強制終了されていた場合の復旧(要件 4.8 / NFR-07)。
+	// ロック取得の直後・開始前サイズの記録(下の Stat)より前でなければならない
+	// 理由は recoverFromJournal の注記を参照。
+	if err := recoverFromJournal(cfg.Out, f); err != nil {
+		closeLocked(f)
+		return nil, err
+	}
 
 	info, err := f.Stat()
 	if err != nil {
@@ -298,6 +336,15 @@ func prepareAppend(cfg *Config, f *os.File, tail io.ReaderAt) (*OutputManager, e
 			Code: ExitOutput,
 			Err:  fmt.Errorf("追記先 %q の書き込み位置を末尾へ移せない: %w", cfg.Out, err),
 		}
+	}
+
+	// 追記の 1 バイト目を書く前に開始前サイズを記録して同期する(要件 4.8 / NFR-07)。
+	// ここまでの段はファイルへ 1 バイトも書いておらず、最初の書き込みは WriteRecord
+	// なので、この配置が design.md の不変条件「ジャーナルが sync される前に追記の
+	// 1 バイト目を書かない」そのものになる。
+	if err := writeJournal(cfg.Out, baseSize); err != nil {
+		closeLocked(f)
+		return nil, err
 	}
 
 	return &OutputManager{
@@ -341,6 +388,237 @@ func needsNewlinePadding(r io.ReaderAt, size int64) (bool, error) {
 		err = io.ErrUnexpectedEOF
 	}
 	return false, err
+}
+
+// journalPathOf はジャーナルのパスを返す(design.md「Data Models」)。
+// OutputManager にフィールドとして持たせず毎回組み立てるのは、出力パスと
+// ジャーナルパスの対応を 1 箇所に閉じ込め、取り違えや持ち回りの過程での
+// 陳腐化を起こさないためである。
+func journalPathOf(outPath string) string { return outPath + journalSuffix }
+
+// writeJournal は追記開始前のサイズを記録したジャーナルを作成して同期する
+// (要件 4.8 / NFR-07、design.md「output」の不変条件
+// 「ジャーナルが sync される前に追記の 1 バイト目を書かない」)。
+//
+// 呼び出し位置は prepareAppend の末尾、すなわち「開始前サイズの記録・末尾改行の判定を
+// 終え、まだ 1 バイトも書いていない」時点である。追記の 1 バイト目は最初の WriteRecord
+// (末尾改行の補完、または最初のレコード)であり、タスク 3.3 が補完の改行を openAppend
+// から WriteRecord へ意図的に遅らせたことで、この配置だけで不変条件が成立する。
+//
+// 途中で失敗した場合は作りかけのジャーナルを削除する。中途半端なジャーナルを残すと
+// 次回実行が「解釈不能」として停止してしまうが(手動対処が必要になる)、この時点では
+// まだ 1 バイトも追記していないため、ジャーナルが無いことが正しい状態
+// (=ファイルは開始前サイズのまま)だからである。
+func writeJournal(outPath string, size int64) error {
+	p := journalPathOf(outPath)
+	f, err := os.OpenFile(p, journalOpenFlags, 0o644)
+	if err != nil {
+		return &ExitError{
+			Code: ExitOutput,
+			Err: fmt.Errorf("追記先 %q のジャーナル %q を作成できない"+
+				"(既に存在する場合、前回の実行の残骸が復旧で削除されていない): %w", outPath, p, err),
+		}
+	}
+
+	if _, err := f.Write(fmt.Appendf(nil, "%s%d\n", journalPrefix, size)); err != nil {
+		return journalWriteFailure(outPath, p, f, err)
+	}
+	// ここで同期しておかなければ、追記の 1 バイト目より前にジャーナルがディスクへ
+	// 届いている保証がない(要件 4.8 の復旧はジャーナルの存在だけを手がかりにする)。
+	if err := f.Sync(); err != nil {
+		return journalWriteFailure(outPath, p, f, err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(p)
+		return &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q のジャーナル %q を閉じられない: %w", outPath, p, err),
+		}
+	}
+
+	// ジャーナル本体を同期しても、それを指すディレクトリエントリが同期されるとは
+	// 限らない(POSIX ではディレクトリの fsync が別に要る)。ジャーナルは
+	// 「存在すること」自体が情報なので、エントリが失われると復旧できない。
+	// 失敗しても続行する理由は syncContainingDir の注記を参照。
+	syncContainingDir(p)
+	return nil
+}
+
+// journalWriteFailure はジャーナルの書き込み・同期に失敗したときの後始末とエラー化。
+func journalWriteFailure(outPath, journalPath string, f *os.File, cause error) error {
+	_ = f.Close()
+	_ = os.Remove(journalPath)
+	return &ExitError{
+		Code: ExitOutput,
+		Err:  fmt.Errorf("追記先 %q のジャーナル %q を書き込めない: %w", outPath, journalPath, cause),
+	}
+}
+
+// syncContainingDir は path を含むディレクトリを同期し、直前に作成した
+// エントリの永続性を高める。
+//
+// 失敗しても報告しない。Windows の FlushFileBuffers はディレクトリハンドルを
+// 受け付けず(os.File.Sync が失敗する)、この失敗を理由に追記を止めると
+// 本来の目的である Windows 運用でツールが一切動かなくなる。エントリの同期は
+// 「電源断でも復旧できる」ための上積みであって、本ツールが第一に想定する
+// 強制終了(タイムアウトによるプロセス終了)では、書き込んだ内容は OS の
+// ページキャッシュ経由で次のプロセスから必ず見える。
+func syncContainingDir(path string) {
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
+}
+
+// removeJournal はジャーナルを削除する。存在しない場合は成功として扱う
+// (確定・中断の経路は何度呼ばれても安全でなければならない)。
+func removeJournal(outPath string) error {
+	p := journalPathOf(outPath)
+	if err := os.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return &ExitError{
+			Code: ExitOutput,
+			Err: fmt.Errorf("出力先 %q のジャーナル %q を削除できない"+
+				"(残すと次回の追記実行が誤ったサイズへ切り詰める): %w", outPath, p, err),
+		}
+	}
+	return nil
+}
+
+// recoverFromJournal は、前回のプロセスが追記中に強制終了されていた場合に、
+// 出力ファイルを前回の追記開始前の状態へ復旧する(要件 4.8 / NFR-07)。
+//
+// 呼び出し位置は「ロック取得の直後・開始前サイズの記録より前」でなければならない。
+//   - ロック取得後: design.md「フロー上の決定事項」が定めるとおり、並行実行中の
+//     他プロセスのジャーナルを誤って処理しないため(ロックを取る前に切り詰めると、
+//     いま追記中の他プロセスのデータを破壊しうる)
+//   - Stat より前: 残骸を切り詰める前にサイズを測ると、復旧前の誤ったサイズを
+//     開始前サイズとして記録してしまう
+//
+// 切り詰めは呼び出し元が既に開いてロックしているハンドル f に対して行う。
+// f は appendOpenFlags(O_APPEND を含まない)で開かれており、Windows でも
+// ハンドル経由の Truncate が成立する(appendOpenFlags の注記 (2))。
+// パス経由で開き直さないのは、ロックの外側で切り詰めないためでもある。
+//
+// 解釈できないジャーナルは自動判断せず終了コード 4 で停止し、手動調査に委ねる
+// (design.md「Data Models」)。ジャーナルは「どこまでが利用者のデータか」を決める
+// 唯一の手がかりであり、迷いのある値から切り詰め先を推測することは、復旧のつもりで
+// データを破壊することに等しい。停止する場合はジャーナルも出力ファイルも変更しない。
+func recoverFromJournal(outPath string, f *os.File) error {
+	p := journalPathOf(outPath)
+	raw, err := readJournal(p)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// 前回は正常に確定または中断している。復旧するものはない。
+			return nil
+		}
+		return &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q のジャーナル %q を読めない: %w", outPath, p, err),
+		}
+	}
+
+	size, err := parseJournalSize(raw)
+	if err != nil {
+		return &ExitError{
+			Code: ExitOutput,
+			Err: fmt.Errorf("追記先 %q のジャーナル %q を解釈できない(%w)。"+
+				"自動で復旧せず停止する。内容を確認し、正しい状態へ戻してからジャーナルを削除すること", outPath, p, err),
+		}
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		return &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q のサイズを取得できない(ジャーナル %q の復旧中): %w", outPath, p, err),
+		}
+	}
+	if size > info.Size() {
+		// 追記は「開始前サイズ」を記録するのだから、記録サイズがファイルより大きい状態は
+		// 追記だけでは決して生じない。切り詰めではなく伸長になり NUL の穴を開けるため
+		// Truncate は誤りであり、ジャーナルを無視して追記を続けるのは説明のつかない
+		// 状態の上に書き足すことになる。破損と同じく手動調査に委ねる。
+		return &ExitError{
+			Code: ExitOutput,
+			Err: fmt.Errorf("追記先 %q のジャーナル %q が記録するサイズ %d が現在のサイズ %d を上回る。"+
+				"追記開始前のサイズとしてありえないため自動で復旧せず停止する", outPath, p, size, info.Size()),
+		}
+	}
+
+	// 記録サイズと現在のサイズが等しい場合(ジャーナル作成直後の強制終了)も
+	// そのまま切り詰める。結果は変わらないが、経路を分けないことで
+	// 「復旧したつもりで何もしていない」分岐を作らずに済む。
+	if err := f.Truncate(size); err != nil {
+		return &ExitError{
+			Code: ExitOutput,
+			Err: fmt.Errorf("追記先 %q をジャーナル %q の記録サイズ %d へ切り詰められない: %w",
+				outPath, p, size, err),
+		}
+	}
+	// 切り詰めを確定させてからジャーナルを消す。順序を逆にすると、両者の間で
+	// 強制終了された場合に「伸びたままのファイル」と「復旧の手がかりの消失」が
+	// 同時に起こる。
+	if err := f.Sync(); err != nil {
+		return &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q の復旧後の切り詰めを同期できない(ジャーナル %q): %w", outPath, p, err),
+		}
+	}
+	return removeJournal(outPath)
+}
+
+// readJournal はジャーナルの内容を読む。読み取り量は journalMaxBytes+1 バイトで
+// 打ち切る(超過の検出に 1 バイトだけ余分に読む)。ジャーナルのパスに巨大なファイルが
+// 置かれていても、それをすべてメモリへ載せることはない。
+func readJournal(journalPath string) ([]byte, error) {
+	f, err := os.Open(journalPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	return io.ReadAll(io.LimitReader(f, journalMaxBytes+1))
+}
+
+// parseJournalSize はジャーナルの内容を追記開始前のサイズとして解釈する。
+//
+// 受け付けるのは `size=<10進数>` + LF の 1 行だけである(design.md
+// 「State Management」/「Data Models」)。判定を厳格にしているのは、
+// 少しでも解釈に迷う内容から切り詰め先を推測しないためである(データ保護を
+// 自動復旧より優先する。design.md「Data Models」の設計判断)。したがって
+// 空・接頭辞違い・前後の余分なバイト・複数行・改行なし・符号付き・先頭ゼロ・
+// 10 進数以外・int64 に収まらない値・長すぎる内容は、すべて解釈不能として扱う。
+func parseJournalSize(raw []byte) (int64, error) {
+	if len(raw) > journalMaxBytes {
+		return 0, fmt.Errorf("%d バイトを超えており 1 行の %q ではない", journalMaxBytes, journalPrefix+"<10進数>")
+	}
+	digits, ok := bytes.CutPrefix(raw, []byte(journalPrefix))
+	if !ok {
+		return 0, fmt.Errorf("%q で始まっていない", journalPrefix)
+	}
+	digits, ok = bytes.CutSuffix(digits, []byte("\n"))
+	if !ok {
+		return 0, errors.New("改行で終わっていない(書き込みが途中で切れた可能性がある)")
+	}
+	if len(digits) == 0 {
+		return 0, errors.New("サイズの数字がない")
+	}
+	if len(digits) > 1 && digits[0] == '0' {
+		// 先頭ゼロはこの実装が書くことのない字句であり、素性の知れないジャーナルである。
+		return 0, errors.New("10 進数の先頭にゼロがある")
+	}
+	for _, b := range digits {
+		if b < '0' || b > '9' {
+			// 符号・空白・全角数字・改行を含む複数行はここで落ちる。
+			return 0, fmt.Errorf("10 進数以外のバイト 0x%02X を含む", b)
+		}
+	}
+	size, err := strconv.ParseInt(string(digits), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("int64 として解釈できない: %w", err)
+	}
+	return size, nil
 }
 
 // closeLocked はロックを解放してファイルを閉じる(OutputManager を組み立てる前の
@@ -604,9 +882,21 @@ func (o *OutputManager) commitAppend() error {
 		return o.writeError(err)
 	}
 
-	// 【継ぎ目】ここでジャーナル(<出力名>.journal)を削除するのがタスク 3.4。
-	// design.md「output」の不変条件「ジャーナルの存在=前回の追記が未確定」を保つには、
-	// Sync の後・ロック解放の前でなければならない。
+	// ジャーナルを削除して「この追記は確定した」ことを記録する(要件 4.8 / NFR-07)。
+	// 位置は Sync の後・ロック解放の前でなければならない。
+	//   - Sync の後: 追記した内容がディスクへ届く前にジャーナルを消すと、その間の
+	//     強制終了で「不完全な追記」と「復旧の手がかりの消失」が同時に起こる
+	//   - ロック解放の前: 解放後は別プロセスが同じ出力ファイルのロックを取って追記を
+	//     始め、自分のジャーナルを作りうる。そこで削除すると他プロセスのジャーナルを
+	//     消すことになる
+	//
+	// なお Sync と削除の間で強制終了された場合、次回実行はディスクへ届いている
+	// この追記を開始前サイズへ切り詰める。呼び出し元は結果行も終了コード 0 も
+	// 受け取っていない以上、この実行は失敗として再実行される。追記を残すほうが
+	// 再実行時の重複を生むため、切り詰められるのが正しい挙動である(要件 10.1 の冪等性)。
+	if err := removeJournal(o.cfg.Out); err != nil {
+		return err
+	}
 
 	// unlock の失敗は無視してよい。続く Close がロックを必ず解放するため、
 	// ここで失敗を理由に処理全体を止めると、書き終えた内容を捨てることになる。
@@ -648,10 +938,12 @@ func (o *OutputManager) commitNew() error {
 		}
 	}
 
-	// 【継ぎ目】design.md「output」は、新規モードの置換成功時に stale なジャーナル
-	// (<出力名>.journal)を削除することを求めている。ジャーナルを作るのは追記モード
-	// だけであり、その生成・解釈・削除を一括してタスク 3.4 が実装する。
-	return nil
+	// 置換に成功したので、前回の追記が残した stale なジャーナルを削除する
+	// (design.md「output / 復旧」)。残したままにすると、次の `--append` 実行が
+	// 「前回の追記が未確定」と解釈し、置き換えたばかりのファイルを無関係な記録サイズへ
+	// 切り詰めてしまう。削除できない場合に黙って成功させると、その時限装置を残したまま
+	// 終了コード 0 を返すことになるため、パスを添えて終了コード 4 で報告する。
+	return removeJournal(o.cfg.Out)
 }
 
 // Abort は書き込みを中断し、出力パスを**実行前と同じ状態**へ戻す(要件 4.9 / FR-39)。
@@ -704,6 +996,18 @@ func (o *OutputManager) rollbackAppend() {
 			truncated = true
 		}
 	}
+	if truncated {
+		// 切り詰めが済んでから、かつロックを保持したままジャーナルを削除する
+		// (要件 4.8 / NFR-07)。
+		//   - 切り詰めの後: 先に消すと、両者の間で強制終了された場合に伸びたままの
+		//     ファイルと復旧の手がかりの消失が同時に起こる
+		//   - ロック保持中: 解放後は別プロセスが自分のジャーナルを作りうるため、
+		//     そこでの削除は他プロセスのジャーナルを消す危険がある
+		// Abort は報告経路を持たない best effort であり、削除の失敗は伝えられない。
+		// 失敗して残った場合でも、次回実行は開始前サイズへ切り詰めるだけなので
+		// 状態は一致する(ジャーナルの記録サイズ=いま戻したサイズ)。
+		_ = removeJournal(o.cfg.Out)
+	}
 	// Windows ではハンドルを閉じるまでロックが残る。以降の os.Truncate のためにも
 	// 先に閉じる。
 	o.closeFile()
@@ -724,11 +1028,13 @@ func (o *OutputManager) rollbackAppend() {
 		// ここで失敗しても報告経路はない。プロセスごと強制終了された場合の復旧は、
 		// タスク 3.4 のジャーナルが担う。
 		_ = os.Truncate(o.cfg.Out, o.baseSize)
-	}
 
-	// 【継ぎ目】ここでジャーナル(<出力名>.journal)を削除するのがタスク 3.4。
-	// 切り詰めが済んだ後に削除しなければ、削除と切り詰めの間で強制終了された場合に
-	// 復旧の手がかりが失われる。
+		// パス経由の切り詰めを試みた後にもジャーナルを削除する。ここはロックの外側
+		// だが、削除しないまま終わると次回実行がこの(既に戻したはずの)サイズを
+		// 手がかりに復旧を試みることになる。記録サイズは戻し先と同一なので、
+		// 万一残っても実害はない。
+		_ = removeJournal(o.cfg.Out)
+	}
 }
 
 // cleanupNew は新規作成モードの後始末。一時ファイルを閉じて削除するだけで、

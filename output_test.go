@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -1458,6 +1459,669 @@ func TestRunConversionEmptyArrayCreatesEmptyFile(t *testing.T) {
 	}
 	if info.Size() != 0 {
 		t.Errorf("空配列の出力が %d バイト。0 バイトでなければならない", info.Size())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ジャーナルによる強制終了後復旧(タスク 3.4、要件 4.8 / NFR-07、要件 4.9 / FR-39)
+// ---------------------------------------------------------------------------
+
+// journalPathFor はテストが期待するジャーナルのパス
+// (design.md「Data Models / ジャーナルファイル(復旧契約)」の `<出力パス>.journal`)。
+// 実装側の定数を参照せず文字列で組み立てるのは、パスの契約そのものを見張るためである
+// (tempPathOf と同じ規律)。ジャーナルの名前と配置は design.md
+// 「Revalidation Triggers」に載る外部契約であり、黙って変えてはならない。
+func journalPathFor(out string) string { return out + ".journal" }
+
+// wantJournalBytes は、design.md「Data Models」が定めるジャーナルの内容
+// (`size=<10進数>` + LF、ASCII のみ)を組み立てる。
+func wantJournalBytes(size int64) string { return fmt.Sprintf("size=%d\n", size) }
+
+// assertJournalBytes は、ジャーナルの内容がバイト単位で規定どおりであることを検証する。
+// 「サイズさえ合っていればよい」実装(JSON、テキスト+空白、改行なし、10 進数以外)への
+// 逸脱をここで落とす。ジャーナルは別プロセス(次回起動)が読む唯一の受け渡し形式であり、
+// 形式は実装内部の自由ではない。
+func assertJournalBytes(t *testing.T, out string, wantSize int64) {
+	t.Helper()
+	got, err := os.ReadFile(journalPathFor(out))
+	if err != nil {
+		t.Fatalf("ジャーナル %q を読めない: %v", journalPathFor(out), err)
+	}
+	if want := wantJournalBytes(wantSize); string(got) != want {
+		t.Errorf("ジャーナルの内容が %q。%q でなければならない", got, want)
+	}
+	for i, b := range got {
+		if b >= 0x80 {
+			t.Errorf("ジャーナルの %d バイト目が ASCII 範囲外(0x%02X)。ASCII 1 行でなければならない", i, b)
+			break
+		}
+	}
+}
+
+// TestJournalIsSyncedBeforeFirstAppendedByte は、design.md「output」の不変条件
+// 「ジャーナルが sync される前に追記の 1 バイト目を書かない」を、開いた直後の
+// ディスク上の状態で検証する(要件 4.8 / NFR-07)。
+//
+// openOutput から戻った時点で、(a) ジャーナルが存在し開始前サイズを記録している、
+// (b) 出力ファイルは 1 バイトも変わっていない、の両方が成り立たねばならない。
+// ジャーナルを最初の WriteRecord まで遅らせる実装、末尾改行の補完を openAppend で
+// 先に書いてしまう実装(タスク 3.3 がわざわざ WriteRecord まで遅らせた理由)は
+// ここで落ちる。
+func TestJournalIsSyncedBeforeFirstAppendedByte(t *testing.T) {
+	tests := []struct {
+		name     string
+		noFile   bool
+		existing string
+	}{
+		{name: "末尾が改行でない既存(補完の改行=追記の 1 バイト目が発生する)", existing: `{"旧":1}`},
+		{name: "末尾が改行の既存", existing: "{\"旧\":1}\n"},
+		{name: "空(0 バイト)の既存", existing: ""},
+		{name: "既存ファイルなし(要件 4.3 で新規作成)", noFile: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.ndjson")
+			if !tt.noFile {
+				writeExisting(t, out, tt.existing)
+			}
+
+			om := mustOpenOutput(t, newAppendConfig(out))
+			defer om.Abort()
+
+			// (a) ジャーナルは開いた直後に、開始前サイズを載せて存在していなければならない。
+			assertJournalBytes(t, out, int64(len(tt.existing)))
+
+			// (b) この時点で出力ファイルは 1 バイトも変わっていてはならない。
+			if got := readOutput(t, out); string(got) != tt.existing {
+				t.Errorf("ジャーナルの作成前後で出力ファイルが変わっている\n got=%q\nwant=%q", got, tt.existing)
+			}
+
+			// ディレクトリに現れてよいのは出力ファイルとジャーナルだけ
+			// (要件 11.4 / NFR-13: 一時的に作るファイルは出力と同じディレクトリ)。
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatalf("出力ディレクトリを列挙できない: %v", err)
+			}
+			var names []string
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			want := []string{filepath.Base(out), filepath.Base(journalPathFor(out))}
+			if len(names) != len(want) || names[0] != want[0] || names[1] != want[1] {
+				t.Errorf("追記中のディレクトリ内容が %v。%v でなければならない", names, want)
+			}
+		})
+	}
+}
+
+// TestJournalIsRemovedOnFinalizeAndAbort は、正常確定と自発的な中断の双方で
+// ジャーナルが消えることを検証する(タスク 3.4 の 1 つ目の箇条書き)。
+//
+// ジャーナルの存在は「前回の追記が未確定」を意味する不変条件そのものである
+// (design.md「State Management」)。消し忘れると、次回実行が確定済みの内容を
+// 開始前サイズへ切り詰めてしまう。
+func TestJournalIsRemovedOnFinalizeAndAbort(t *testing.T) {
+	const original = "{\"旧\":1}\n"
+
+	t.Run("正常確定(Finalize)", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "out.ndjson")
+		writeExisting(t, out, original)
+
+		om := mustOpenOutput(t, newAppendConfig(out))
+		writeRecords(t, om, `{"新":1}`)
+		if err := om.Finalize(); err != nil {
+			t.Fatalf("Finalize が失敗した: %v", err)
+		}
+
+		assertNotExist(t, journalPathFor(out), "確定後のジャーナル")
+		if got, want := string(readOutput(t, out)), original+"{\"新\":1}\n"; got != want {
+			t.Errorf("確定後の内容が期待と異なる\n got=%q\nwant=%q", got, want)
+		}
+	})
+
+	t.Run("自発的な中断(Abort)", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "out.ndjson")
+		writeExisting(t, out, original)
+
+		om := mustOpenOutput(t, newAppendConfig(out))
+		writeRecords(t, om, bigRecord("a"))
+		om.Abort()
+
+		assertNotExist(t, journalPathFor(out), "中断後のジャーナル")
+		if got := string(readOutput(t, out)); got != original {
+			t.Errorf("中断後の内容が開始前と異なる\n size=%d want_size=%d", len(got), len(original))
+		}
+	})
+
+	t.Run("0 件の追記でも確定でジャーナルは消える", func(t *testing.T) {
+		dir := t.TempDir()
+		out := filepath.Join(dir, "out.ndjson")
+		writeExisting(t, out, original)
+
+		om := mustOpenOutput(t, newAppendConfig(out))
+		if err := om.Finalize(); err != nil {
+			t.Fatalf("Finalize が失敗した: %v", err)
+		}
+
+		assertNotExist(t, journalPathFor(out), "0 件確定後のジャーナル")
+		if got := string(readOutput(t, out)); got != original {
+			t.Errorf("0 件の追記でファイルが変わった\n got=%q\nwant=%q", got, original)
+		}
+	})
+}
+
+// TestAppendRecoversFromSimulatedHardKill は、タスク 3.4 の完了条件そのものである。
+//
+// 「ジャーナル作成後・追記中・切り詰め前」の各時点で強制終了された場合に
+// ディスクへ残る状態を再現し、次回実行が開始前状態へ復旧してから追記することを
+// バイト単位で検証する(要件 4.8 / NFR-07、design.md「Testing Strategy /
+// Integration Tests」3)。
+//
+// 単体テストではプロセスを実際に強制終了できないため、強制終了が残す
+// 「出力ファイル+ジャーナル」の組み合わせを直接作って次回実行を走らせる。
+// 3 つの時点はいずれも「ジャーナルが存在し、ファイルが記録サイズ以上に伸びている
+// (または等しい)」という同じ形に落ちるが、伸び方が異なる(0 バイト・途中で切れた行・
+// 完全な行)ため、切り詰め先を取り違える実装の落ち方が変わる。
+func TestAppendRecoversFromSimulatedHardKill(t *testing.T) {
+	const base = `{"既存":"改行なしで終わる行"}`
+	baseSize := int64(len(base))
+
+	tests := []struct {
+		name   string
+		onDisk string
+	}{
+		{
+			name: "ジャーナル作成後・追記の 1 バイト目を書く前に強制終了",
+			// ファイルは開始前のまま。復旧は「何もしない切り詰め」に落ち着く。
+			onDisk: base,
+		},
+		{
+			name: "追記中に強制終了(途中で切れた行が残る)",
+			// 補完の改行と書きかけのレコードがファイルへ届いた状態。
+			onDisk: base + "\n" + `{"途中":123`,
+		},
+		{
+			name: "ロールバックの切り詰め前に強制終了(完全な行まで書けている)",
+			// 中断処理が切り詰めを行う直前に消えた状態。行としては閉じているため、
+			// 「壊れていないから残してよい」と判断する実装はここで落ちる。
+			// 呼び出し元はこの実行の成功を知らされていない以上、追記は無かったことに
+			// しなければ再実行で重複する(要件 10.1 の冪等性)。
+			onDisk: base + "\n" + `{"a":1}` + "\n" + `{"b":2}` + "\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.ndjson")
+			writeExisting(t, out, tt.onDisk)
+			writeExisting(t, journalPathFor(out), wantJournalBytes(baseSize))
+
+			om := mustOpenOutput(t, newAppendConfig(out))
+
+			// 復旧はロック取得後・Stat より前に行われねばならない(design.md
+			// 「フロー上の決定事項」、tasks.md「タスク 3.3 が確定した output の契約」)。
+			// 順序を取り違えると、復旧前の誤ったサイズが開始前サイズとして記録される。
+			if om.baseSize != baseSize {
+				t.Errorf("開始前サイズが %d。復旧後の %d でなければならない"+
+					"(復旧を Stat より後に置くとこうなる)", om.baseSize, baseSize)
+			}
+			// 復旧は「処理を始める前」に完了していなければならない(要件 4.8)。
+			info, err := os.Stat(out)
+			if err != nil {
+				t.Fatalf("復旧後のファイルを stat できない: %v", err)
+			}
+			if info.Size() != baseSize {
+				t.Errorf("復旧後のファイルサイズが %d。%d でなければならない", info.Size(), baseSize)
+			}
+			// 復旧に使ったジャーナルは削除され、この実行のジャーナルに置き換わっている。
+			assertJournalBytes(t, out, baseSize)
+
+			writeRecords(t, om, `{"新":1}`)
+			if err := om.Finalize(); err != nil {
+				t.Fatalf("Finalize が失敗した: %v", err)
+			}
+
+			want := base + "\n" + `{"新":1}` + "\n"
+			if got := readOutput(t, out); string(got) != want {
+				t.Errorf("復旧後の追記結果が期待と異なる\n got=%q\nwant=%q", got, want)
+			}
+			assertNotExist(t, journalPathFor(out), "確定後のジャーナル")
+		})
+	}
+}
+
+// TestRecoveredJournalIsDeletedBeforeNextJournalIsWritten は、復旧が残存ジャーナルを
+// 確実に削除することを、「削除しなければ次の実行が成立しない」という形で固定する
+// (タスク 3.4 の 2 つ目の箇条書き)。
+//
+// 復旧の切り詰めだけを行ってジャーナルを消し忘れる実装は、ディスク上の最終状態が
+// 正しい実装と一致しうる(この実行のジャーナルで上書きされるため)。それを見分けるため、
+// 実装はジャーナルを排他的に作成する契約になっている。すなわち「消し忘れ」は
+// 次のジャーナル作成の失敗として必ず露見する。
+func TestRecoveredJournalIsDeletedBeforeNextJournalIsWritten(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const base = "{\"既存\":1}\n"
+	writeExisting(t, out, base+`{"途中":`)
+	writeExisting(t, journalPathFor(out), wantJournalBytes(int64(len(base))))
+
+	om, err := openOutput(newAppendConfig(out))
+	if err != nil {
+		t.Fatalf("残存ジャーナルからの復旧で openOutput が失敗した"+
+			"(復旧がジャーナルを削除していない可能性がある): %v", err)
+	}
+	writeRecords(t, om, `{"新":1}`)
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	want := base + `{"新":1}` + "\n"
+	if got := readOutput(t, out); string(got) != want {
+		t.Errorf("復旧後の内容が期待と異なる\n got=%q\nwant=%q", got, want)
+	}
+}
+
+// TestCorruptJournalStopsWithExitCodeFour は、解釈できないジャーナルを自動判断せず
+// 終了コード 4 で停止することを検証する(タスク 3.4 の 2 つ目の箇条書き、
+// design.md「Data Models」:「解釈不能なジャーナル(破損)は終了コード 4 で停止し、
+// 手動調査に委ねる」)。
+//
+// 判定は厳格でなければならない。ジャーナルは「どこまでが利用者のデータか」を決める
+// 唯一の手がかりであり、少しでも解釈に迷う値から切り詰め先を推測すると、
+// 復旧のつもりでデータを破壊する。停止時は出力ファイルもジャーナルも 1 バイトも
+// 変えず、そのまま手動調査に委ねる。
+func TestCorruptJournalStopsWithExitCodeFour(t *testing.T) {
+	tests := []struct {
+		name    string
+		journal string
+	}{
+		{"空(0 バイト。作成直後に強制終了した場合など)", ""},
+		{"size= の後に数字がない", "size=\n"},
+		{"数字ではない", "size=abc\n"},
+		{"負の数(開始前サイズになりえない)", "size=-1\n"},
+		{"数字の後に余分な文字がある", "size=12 破損\n"},
+		{"複数行", "size=1\nsize=2\n"},
+		{"int64 に収まらない巨大な数", "size=99999999999999999999999\n"},
+		{"ASCII 範囲外(全角数字)", "size=１２\n"},
+		{"末尾の改行がない(書き込みが途中で切れた)", "size=12"},
+		{"先頭ゼロ(この実装が書くことのない字句)", "size=007\n"},
+		{"size= で始まらない", "12\n"},
+		{"前置の空白", " size=12\n"},
+		{"接頭辞の綴りが違う", "Size=12\n"},
+		{"1 行に収まらない長さ(ジャーナルの体を成さない)", "size=12\n" + strings.Repeat("x", 128)},
+		{"数字が桁あふれするほど長い", "size=" + strings.Repeat("9", 64) + "\n"},
+	}
+
+	const original = "{\"既存\":\"壊れたジャーナルがあっても 1 バイトも変えてはならない\"}\n"
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.ndjson")
+			writeExisting(t, out, original)
+			writeExisting(t, journalPathFor(out), tt.journal)
+
+			om, err := openOutput(newAppendConfig(out))
+			if om != nil {
+				om.Abort()
+				t.Fatal("解釈できないジャーナルがあるのに OutputManager が返った" +
+					"(自動判断せず停止しなければならない)")
+			}
+			if code := exitCodeOf(t, err); code != ExitOutput {
+				t.Errorf("終了コードが %d。ジャーナル破損は %d でなければならない", code, ExitOutput)
+			}
+			if !strings.Contains(err.Error(), journalPathFor(out)) {
+				t.Errorf("エラーメッセージにジャーナルのパスが含まれない(手動調査に委ねられない): %v", err)
+			}
+			// 「解釈できないジャーナルとして停止した」ことまで確かめる。
+			// ジャーナルは排他的に作成されるため、復旧が破損を見逃して素通りしても
+			// 直後のジャーナル作成が EEXIST で失敗し、同じ終了コード 4 になる。
+			// この検査がないと、破損の検出を丸ごと外す退行を区別できない。
+			if !strings.Contains(err.Error(), "解釈できない") {
+				t.Errorf("ジャーナルの解釈失敗として報告されていない"+
+					"(破損の検出を外しても排他的作成の失敗で同じ終了コードになるため区別が要る): %v", err)
+			}
+
+			// 出力ファイルは 1 バイトも変わってはならない。
+			if got := readOutput(t, out); string(got) != original {
+				t.Errorf("停止時に出力ファイルが変わった\n got=%q\nwant=%q", got, original)
+			}
+			// ジャーナルも残さねばならない(手動調査の材料)。
+			got, err := os.ReadFile(journalPathFor(out))
+			if err != nil {
+				t.Fatalf("停止時にジャーナルが失われた: %v", err)
+			}
+			if string(got) != tt.journal {
+				t.Errorf("停止時にジャーナルが書き換わった\n got=%q\nwant=%q", got, tt.journal)
+			}
+		})
+	}
+}
+
+// TestUnreadableJournalStopsWithExitCodeFour は、ジャーナルを読めない場合にも
+// 停止することを検証する。握り潰して「ジャーナルなし」と扱うと、前回の
+// 未確定の追記がそのまま残った上へさらに追記することになる(要件 4.8 の破綻)。
+//
+// root 実行下では権限による読み取り失敗を作れないため、ジャーナルのパスを
+// ディレクトリにして読み取りを失敗させる。
+func TestUnreadableJournalStopsWithExitCodeFour(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = "{\"既存\":1}\n"
+	writeExisting(t, out, original)
+	if err := os.Mkdir(journalPathFor(out), 0o755); err != nil {
+		t.Fatalf("読めないジャーナルを準備できない: %v", err)
+	}
+
+	om, err := openOutput(newAppendConfig(out))
+	if om != nil {
+		om.Abort()
+		t.Fatal("ジャーナルを読めないのに OutputManager が返った")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	if !strings.Contains(err.Error(), journalPathFor(out)) {
+		t.Errorf("エラーメッセージにジャーナルのパスが含まれない: %v", err)
+	}
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("停止時に出力ファイルが変わった\n got=%q\nwant=%q", got, original)
+	}
+}
+
+// TestJournalLargerThanFileStopsWithExitCodeFour は、記録サイズが現在のファイルサイズを
+// 上回るジャーナルを解釈不能として扱い、終了コード 4 で停止することを検証する。
+//
+// 【判断】追記は「開始前サイズ」を記録するのだから、記録サイズがファイルより大きい状態は
+// 追記だけでは決して生じない。誰かがファイルを差し替えた・切り詰めた、あるいは
+// ジャーナルが別のファイルのものである、といった説明のつかない事態が起きている。
+//   - 記録サイズへ「切り詰める」ことはできない(Truncate は伸長になり、NUL の穴を
+//     開けて NDJSON を壊す)
+//   - ジャーナルを無視して追記を続けるのは、説明のつかない状態の上に書き足すこと
+//     であり、要件 4.8 が守ろうとしている「開始前状態」の定義を放棄する
+//
+// したがって破損ジャーナルと同じ扱い(停止して手動調査)が唯一の安全な選択である。
+func TestJournalLargerThanFileStopsWithExitCodeFour(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = "{\"既存\":1}\n"
+	writeExisting(t, out, original)
+	writeExisting(t, journalPathFor(out), wantJournalBytes(int64(len(original))+1))
+
+	om, err := openOutput(newAppendConfig(out))
+	if om != nil {
+		om.Abort()
+		t.Fatal("記録サイズがファイルより大きいのに OutputManager が返った" +
+			"(伸長も無視も要件 4.8 の復旧ではない)")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("停止時に出力ファイルが変わった(伸長・切り詰めのいずれも行ってはならない)\n got=%q\nwant=%q",
+			got, original)
+	}
+	if got := readOutput(t, journalPathFor(out)); string(got) != wantJournalBytes(int64(len(original))+1) {
+		t.Errorf("停止時にジャーナルが書き換わった: %q", got)
+	}
+}
+
+// TestNewModeRemovesStaleJournalOnCommit は、新規作成モードの置換成功時に stale な
+// ジャーナルを削除することを検証する(タスク 3.4 の 2 つ目の箇条書き、
+// design.md「output / 復旧」)。
+//
+// 残したままにすると、次の `--append` 実行が「前回の追記が未確定」と解釈し、
+// 置き換えたばかりのファイルを無関係な記録サイズへ切り詰める。すなわち
+// 削除の抜けは、次回実行でのデータ消失として現れる。ここではその因果まで通して確認する。
+func TestNewModeRemovesStaleJournalOnCommit(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	writeExisting(t, out, strings.Repeat("{\"古い\":\"内容\"}\n", 10))
+	// 前回の追記が強制終了された痕跡。サイズは新しい内容と無関係な値にしておく。
+	writeExisting(t, journalPathFor(out), wantJournalBytes(3))
+
+	cfg := newOutputConfig(out)
+	cfg.Overwrite = true
+	om := mustOpenOutput(t, cfg)
+	writeRecords(t, om, `{"新しい":"内容"}`)
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	const want = "{\"新しい\":\"内容\"}\n"
+	if got := readOutput(t, out); string(got) != want {
+		t.Errorf("置換後の内容が期待と異なる\n got=%q\nwant=%q", got, want)
+	}
+	assertNotExist(t, journalPathFor(out), "置換成功後の stale なジャーナル")
+
+	// 削除されていれば、続く追記実行は切り詰めを行わずに書き足せる。
+	om2 := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om2, `{"追記":1}`)
+	if err := om2.Finalize(); err != nil {
+		t.Fatalf("後続の追記の Finalize が失敗した: %v", err)
+	}
+	if got, want2 := string(readOutput(t, out)), want+"{\"追記\":1}\n"; got != want2 {
+		t.Errorf("stale なジャーナルが後続の追記を壊した\n got=%q\nwant=%q", got, want2)
+	}
+}
+
+// TestNewModeReportsStaleJournalRemovalFailure は、置換成功後の stale ジャーナル削除に
+// 失敗した場合、それを黙って見逃さないことを検証する。
+//
+// 見逃すと「次回の追記実行が新しいファイルを無関係なサイズへ切り詰める」時限装置を
+// 残したまま正常終了することになる。終了コード 4 で報告し、パスを添えて手動対処へ
+// 委ねるほうが安全である(design.md「Error Handling」の出力書き込みエラー)。
+//
+// root 実行下でも失敗させられるよう、ジャーナルのパスを「空でないディレクトリ」に
+// しておく(os.Remove は ENOTEMPTY で失敗する)。
+func TestNewModeReportsStaleJournalRemovalFailure(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	if err := os.Mkdir(journalPathFor(out), 0o755); err != nil {
+		t.Fatalf("削除できないジャーナルを準備できない: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(journalPathFor(out), "中身"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("削除できないジャーナルを準備できない: %v", err)
+	}
+
+	om := mustOpenOutput(t, newOutputConfig(out))
+	writeRecords(t, om, `{"a":1}`)
+
+	err := om.Finalize()
+	if err == nil {
+		t.Fatal("stale なジャーナルを削除できないのに Finalize が成功として報告された")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	if !strings.Contains(err.Error(), journalPathFor(out)) {
+		t.Errorf("エラーメッセージにジャーナルのパスが含まれない: %v", err)
+	}
+}
+
+// TestRecoveryTruncateFailureIsReported は、復旧の切り詰めに失敗した場合に
+// 追記を始めず終了コード 4 で停止することを検証する。
+//
+// ここを握り潰すと、前回の未確定の追記が残ったままのファイルへ、さらに追記を
+// 重ねることになる(要件 4.8 の復旧が黙って成立しなくなる)。
+//
+// 実ファイルの Truncate を失敗させる手立てが root 実行下ではないため、
+// パイプの書き込み端を渡す(ftruncate はパイプに対して EINVAL を返す)。
+// prepareAppend が末尾読み取り先を引数で受けているのと同じ理由の注入である。
+func TestRecoveryTruncateFailureIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("パイプのハンドルに対するロックの意味論が異なるため、この注入は非 Windows 限定")
+	}
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	// 記録サイズ 0 は、パイプの Stat が返すサイズ 0 と一致する。したがって
+	// 「記録サイズ > 現在サイズ」の停止条件には掛からず、切り詰めまで到達する。
+	writeExisting(t, journalPathFor(out), wantJournalBytes(0))
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("パイプを作成できない: %v", err)
+	}
+	defer func() { _ = r.Close() }()
+	defer func() { _ = w.Close() }()
+
+	om, err := prepareAppend(newAppendConfig(out), w, &countingReaderAt{})
+	if om != nil {
+		om.Abort()
+		t.Fatal("復旧の切り詰めに失敗したのに準備が成功した")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	// メッセージがジャーナルに言及していることまで確かめる。パイプに対しては
+	// 後段の Seek も失敗するため、これがないと「復旧で止まった」ことを
+	// 「準備の別の段で止まった」ことと区別できない。
+	if !strings.Contains(err.Error(), journalPathFor(out)) {
+		t.Errorf("復旧の失敗として報告されていない(メッセージにジャーナルのパスがない): %v", err)
+	}
+	// 復旧に失敗した以上、ジャーナルを消してはならない(手がかりが失われる)。
+	if _, err := os.Stat(journalPathFor(out)); err != nil {
+		t.Errorf("復旧の失敗時にジャーナルが失われた: %v", err)
+	}
+}
+
+// TestJournalPathIsBesideOutput は、ジャーナルが出力ファイルと同一ディレクトリに
+// 決定的な名前で置かれることを検証する(要件 11.4 / NFR-13、design.md「Data Models」)。
+// 一時ディレクトリや作業ディレクトリへ置く実装(要件 11.4 違反)はここで落ちる。
+func TestJournalPathIsBesideOutput(t *testing.T) {
+	const out = "/var/data/出力 結果.ndjson"
+	got := journalPathOf(out)
+	if want := journalPathFor(out); got != want {
+		t.Errorf("ジャーナルのパスが %q。%q でなければならない", got, want)
+	}
+	if dir := filepath.Dir(got); dir != filepath.Dir(out) {
+		t.Errorf("ジャーナルのディレクトリが %q。出力と同じ %q でなければならない", dir, filepath.Dir(out))
+	}
+}
+
+// TestJournalOpenFlagsAreSafe は、ジャーナルを作成するフラグの値そのものを見張る。
+//
+//   - O_EXCL: 復旧が残存ジャーナルを削除し損ねた場合に、ディスク上の最終状態が
+//     正しい実装と一致してしまう(この実行のジャーナルで上書きされるため)。
+//     排他的作成にしておけば、その退行は作成の失敗として必ず露見する。
+//   - O_APPEND なし: Windows で O_APPEND を付けたハンドルは FILE_WRITE_DATA を失う
+//     (appendOpenFlags の注記)。ジャーナルを Truncate することはないが、同じ罠を
+//     持ち込まない規律として値で固定する。
+//   - O_TRUNC なし: O_EXCL と併用しても意味がなく、O_EXCL を外す変更が入ったときに
+//     「黙って上書きする」挙動へ滑り落ちる余地を残さない。
+func TestJournalOpenFlagsAreSafe(t *testing.T) {
+	if journalOpenFlags&os.O_EXCL == 0 {
+		t.Error("ジャーナルを排他的に作成していない。復旧の削除漏れが検出できなくなる")
+	}
+	if journalOpenFlags&os.O_CREATE == 0 {
+		t.Error("ジャーナルが O_CREATE で開かれていない。新規に作成できない")
+	}
+	if journalOpenFlags&os.O_APPEND != 0 {
+		t.Error("ジャーナルを O_APPEND で開いている(Windows 固有の罠を持ち込まない規律)")
+	}
+	if journalOpenFlags&os.O_TRUNC != 0 {
+		t.Error("ジャーナルを O_TRUNC で開いている。排他的作成と両立しない")
+	}
+}
+
+// TestParseJournalSizeAcceptsOnlyCanonicalLine は、ジャーナルの解釈が
+// design.md「Data Models」の定める 1 行(`size=<10進数>` + LF)だけを受け付け、
+// それ以外を漏れなく拒否することを検証する。
+//
+// 受理側は上限・下限・境界を、拒否側は「もっともらしいが解釈してはならない」形を
+// 押さえる。ここが緩むと、破損したジャーナルから推測した位置でファイルを切り詰める。
+func TestParseJournalSizeAcceptsOnlyCanonicalLine(t *testing.T) {
+	t.Run("受理", func(t *testing.T) {
+		tests := []struct {
+			raw  string
+			want int64
+		}{
+			{"size=0\n", 0},
+			{"size=1\n", 1},
+			{"size=10\n", 10},
+			{"size=1234567890\n", 1234567890},
+			{"size=9223372036854775807\n", 9223372036854775807}, // int64 の最大値
+		}
+		for _, tt := range tests {
+			t.Run(tt.raw, func(t *testing.T) {
+				got, err := parseJournalSize([]byte(tt.raw))
+				if err != nil {
+					t.Fatalf("正規のジャーナルを拒否した: %v", err)
+				}
+				if got != tt.want {
+					t.Errorf("サイズが %d。%d でなければならない", got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("拒否", func(t *testing.T) {
+		tests := []struct {
+			name string
+			raw  string
+		}{
+			{"空", ""},
+			{"改行だけ", "\n"},
+			{"接頭辞だけ", "size="},
+			{"接頭辞と改行だけ", "size=\n"},
+			{"接頭辞がない", "123\n"},
+			{"接頭辞の大文字小文字違い", "SIZE=1\n"},
+			{"末尾の改行がない", "size=1"},
+			{"CRLF 終端(ASCII 1 行の規定は LF)", "size=1\r\n"},
+			{"改行が 2 個", "size=1\n\n"},
+			{"複数行", "size=1\nsize=2\n"},
+			{"前置の空白", " size=1\n"},
+			{"後置の空白", "size=1 \n"},
+			{"数字の後に文字", "size=1x\n"},
+			{"正符号", "size=+1\n"},
+			{"負符号", "size=-1\n"},
+			{"小数", "size=1.5\n"},
+			{"16 進表記", "size=0x10\n"},
+			{"先頭ゼロ", "size=01\n"},
+			{"先頭ゼロ(ゼロだけは受理される)", "size=00\n"},
+			{"int64 の最大値+1", "size=9223372036854775808\n"},
+			{"桁あふれ", "size=" + strings.Repeat("9", 30) + "\n"},
+			{"全角数字", "size=１\n"},
+			{"NUL 混入", "size=1\x00\n"},
+			{"長すぎる", "size=1\n" + strings.Repeat("x", journalMaxBytes)},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				got, err := parseJournalSize([]byte(tt.raw))
+				if err == nil {
+					t.Fatalf("解釈してはならないジャーナル %q をサイズ %d として受理した", tt.raw, got)
+				}
+			})
+		}
+	})
+}
+
+// TestSyncContainingDir は、ジャーナル作成後のディレクトリ同期が実在のディレクトリに
+// 対して呼べること、および存在しないディレクトリでも呼び出し側を巻き込まないことを
+// 検証する(要件 4.8 の永続性の上積み)。
+//
+// 【限界】同期が実際に行われたかはファイルシステム API からは観測できない。
+// この関数の呼び出しが writeJournal から外される変異は、どのテストでも検出できない
+// (tasks.md の未解決所見に記録した Sync 一般の限界と同じ性質)。
+func TestSyncContainingDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "out.ndjson.journal")
+	if err := os.WriteFile(path, []byte(wantJournalBytes(0)), 0o644); err != nil {
+		t.Fatalf("ジャーナルを準備できない: %v", err)
+	}
+	// 失敗しても報告しない契約(Windows のディレクトリハンドルは Sync できない)。
+	// panic せず戻ることと、対象を壊さないことを確認する。
+	syncContainingDir(path)
+	syncContainingDir(filepath.Join(dir, "存在しない", "out.ndjson.journal"))
+
+	if got := readOutput(t, path); string(got) != wantJournalBytes(0) {
+		t.Errorf("ディレクトリ同期でジャーナルが変わった: %q", got)
 	}
 }
 
