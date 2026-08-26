@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 )
@@ -12,12 +13,16 @@ import (
 // output は出力ファイルの全ライフサイクル(排他・復旧・書き込み・確定・中断)を
 // 単独で所有するコンポーネント(design.md「output(出力ファイル管理)」)。
 //
-// 【このファイルの実装範囲(タスク 3.2)】
-// 新規作成モード(--append なし)のみを実装する。追記モードとロールバックは
-// タスク 3.3、ジャーナルによる強制終了後の復旧はタスク 3.4 の責務であり、
-// それぞれの継ぎ目は openOutput / Finalize / Abort の追記モード分岐に置いてある。
-// 追記モードに関わる状態(開始前サイズ、ジャーナルのパス)は、担当タスクが
-// OutputManager へ追加する。
+// 【このファイルの実装範囲(タスク 3.2 / 3.3)】
+// 新規作成モード(--append なし、タスク 3.2)と追記モードおよびプロセス内の
+// ロールバック(--append、タスク 3.3)を実装する。ジャーナルによる強制終了後の
+// 復旧(要件 4.8 / NFR-07)はタスク 3.4 の責務であり、その継ぎ目は
+// openAppend(ロック取得の直後)、commitAppend、rollbackAppend に置いてある。
+// ジャーナルのパスと読み書きは、担当タスクが OutputManager へ追加する。
+//
+// タスク 3.3 の範囲でのロールバックは「同一プロセス内の失敗 → 開始前サイズへの
+// 切り詰め」までであり、プロセスごと強制終了された場合の復旧は成立しない
+// (切り詰めを行う主体が消えるため)。それを担保するのがタスク 3.4 のジャーナルである。
 //
 // 【design.md との差異(実装上の必然)】
 // design.md は Finalize の順序を「Flush→Sync→(rename|journal削除)→unlock」と
@@ -51,7 +56,7 @@ type outputMode int
 const (
 	// modeNew は新規作成モード(--append なし)。一時ファイルへ書き、rename で置換する。
 	modeNew outputMode = iota
-	// modeAppend は追記モード(--append)。タスク 3.3 / 3.4 が実装する。
+	// modeAppend は追記モード(--append)。出力ファイル自身へ直接書き足す。
 	modeAppend
 )
 
@@ -82,9 +87,17 @@ type OutputManager struct {
 	state outputState
 	// newline は行の区切りに使う改行コード(要件 3.3 / FR-12)。
 	newline string
-	// tempPath は新規作成モードの一時ファイルのパス。
+	// tempPath は新規作成モードの一時ファイルのパス。追記モードでは空文字列。
 	tempPath string
-	// file は書き込み中のファイル。新規作成モードでは一時ファイルを指す。
+	// baseSize は追記モードの「追記開始前のサイズ」(要件 4.4 / FR-23、4.9 / FR-39)。
+	// 中断・確定失敗時はこのサイズへ切り詰めて元の状態に戻す。
+	baseSize int64
+	// padPending は追記モードで既存ファイルの末尾に改行を補う必要があるかどうか
+	// (要件 4.5 / FR-24)。補完の改行は「追記の 1 バイト目」なので、開いた時点では
+	// 書かず、最初のレコードの直前に書く(WriteRecord)。
+	padPending bool
+	// file は書き込み中のファイル。新規作成モードでは一時ファイル、
+	// 追記モードでは出力ファイル自身を指す。
 	file *os.File
 	// closed は file を閉じ済みかどうか。二重クローズを避ける。
 	closed bool
@@ -103,28 +116,16 @@ var _ RecordSink = (*OutputManager)(nil)
 //
 // Preconditions: cfg.Out は絶対パス。
 // Postconditions: 返した OutputManager は Finalize か Abort のどちらか 1 回で必ず閉じる。
-// 失敗した場合は OutputManager を返さず、出力パスにも一時ファイルにも痕跡を残さない。
+// 失敗した場合は OutputManager を返さず、新規作成モードでは出力パスにも一時ファイルにも
+// 痕跡を残さない。追記モードでは要件 4.3 / FR-22 に従って準備の最初に出力ファイルを
+// 作成するため、その後の段(ロック取得・サイズ取得・末尾判定)で失敗すると 0 バイトの
+// ファイルが残りうる。これは「開始前サイズ 0」の状態であり、追記モードの Abort が
+// 残す状態(要件 4.9 / FR-39)と一致する。
 func openOutput(cfg *Config) (*OutputManager, error) {
 	if cfg.Append {
-		// 【継ぎ目】追記モードはタスク 3.3(ロック・開始前サイズ・末尾改行の補完・
-		// ロールバック)とタスク 3.4(ジャーナルによる復旧)が実装する。
-		// ここは openAppend(cfg) の呼び出しに置き換わる。
-		return nil, errAppendNotWired("openOutput")
+		return openAppend(cfg)
 	}
 	return openNew(cfg)
-}
-
-// errAppendNotWired は追記モードが未結線であることを表すエラーを返す。
-//
-// 終了コードに 4(出力書き込みエラー)ではなく 9(予期しない内部エラー)を割り当てる。
-// 呼び出し元(DataSpider スクリプト)にとって 4 は「権限やディスク、同時実行など
-// 環境側の失敗」であり、リトライや調査の対象になる。未実装の経路がそれを装うと
-// 運用者の切り分けを誤らせるため、内部の欠陥として報告する。
-func errAppendNotWired(op string) error {
-	return &ExitError{
-		Code: ExitInternal,
-		Err:  fmt.Errorf("%s: 追記モード(--append)は未実装(タスク 3.3 で実装する)", op),
-	}
 }
 
 // openNew は新規作成モードの準備を行う。
@@ -165,6 +166,122 @@ func openNew(cfg *Config) (*OutputManager, error) {
 		file:     f,
 		w:        bufio.NewWriterSize(f, writeBufferSize),
 	}, nil
+}
+
+// openAppend は追記モードの準備を行う(design.md「output」の「追記モード」)。
+//
+// 手順は「出力ファイルを開く(なければ作成)→ 出力ファイル自身をロック →
+// 開始前サイズを記録 → 末尾 1 バイトで改行の有無を確認」。
+// 新規作成モードと違い、ロックの対象は一時ファイルではなく出力ファイル自身である
+// (design.md「排他」: 「追記はロックを出力ファイル自身に取得」)。追記は出力パスへ
+// 直接書き足すため、守るべき対象が出力ファイルそのものだからである。
+func openAppend(cfg *Config) (*OutputManager, error) {
+	// 【O_RDWR は必須。O_WRONLY へ「単純化」してはならない】
+	// Windows の syscall.Open は O_APPEND かつ O_TRUNC なしのとき GENERIC_WRITE を
+	// 落とす(syscall_windows.go)。O_WRONLY|O_APPEND|O_CREATE では GENERIC_READ も
+	// GENERIC_WRITE も残らないハンドルになり、そのどちらかを要求する LockFileEx が
+	// ERROR_ACCESS_DENIED で失敗する。その値は ErrLocked へ写像されず素通しされるため、
+	// 要件 4.6 / FR-25 の同時実行排他が Windows 実機でのみ無言で壊れる
+	// (非 Windows の tryLock は no-op のため、テストでも静的解析でも検出できない)。
+	// O_RDWR なら GENERIC_READ が残り成立する。末尾 1 バイトの読み取り(要件 4.5)にも
+	// 読み取り権限が要る。
+	f, err := os.OpenFile(cfg.Out, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return nil, &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q を開けない: %w", cfg.Out, err),
+		}
+	}
+
+	if err := tryLock(f); err != nil {
+		// 出力ファイルは自分が作ったとは限らないため、新規モードの一時ファイルと違い
+		// 削除しない(実行前から存在したデータを失わないこと、要件 4.9)。
+		_ = f.Close()
+		if errors.Is(err, ErrLocked) {
+			return nil, &ExitError{
+				Code: ExitOutput,
+				Err:  fmt.Errorf("追記先 %q は別のプロセスが処理中: %w", cfg.Out, err),
+			}
+		}
+		return nil, &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q をロックできない: %w", cfg.Out, err),
+		}
+	}
+
+	// 【継ぎ目】ジャーナル(<出力名>.journal)による強制終了後の復旧(要件 4.8 / NFR-07)は
+	// タスク 3.4 が実装する。その位置はここ、すなわち「ロック取得の直後・開始前サイズの
+	// 記録より前」でなければならない。design.md「フロー上の決定事項」は復旧をロック取得後に
+	// 限ると定めており、また前回の残骸を切り詰める前にサイズを測ると、復旧前の誤った
+	// サイズを開始前サイズとして記録してしまう。
+
+	info, err := f.Stat()
+	if err != nil {
+		closeLocked(f)
+		return nil, &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q のサイズを取得できない: %w", cfg.Out, err),
+		}
+	}
+	baseSize := info.Size()
+
+	pad, err := needsNewlinePadding(f, baseSize)
+	if err != nil {
+		closeLocked(f)
+		return nil, &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("追記先 %q の末尾 1 バイトを読めない: %w", cfg.Out, err),
+		}
+	}
+
+	return &OutputManager{
+		cfg:        cfg,
+		mode:       modeAppend,
+		state:      stateOpen,
+		newline:    newlineOf(cfg),
+		baseSize:   baseSize,
+		padPending: pad,
+		file:       f,
+		w:          bufio.NewWriterSize(f, writeBufferSize),
+	}, nil
+}
+
+// needsNewlinePadding は、サイズ size のファイルが改行で終わっていない
+// (=追記の前に改行を補う必要がある)かを判定する(要件 4.5 / FR-24)。
+//
+// design.md「output」が定めるとおり、読むのは末尾の 1 バイトだけである。
+// 追記先は運用上 GB 級まで育ちうるため、全体や末尾ブロックを読む実装は
+// 実行のたびに追記先のサイズに比例した I/O を払うことになる。
+//
+// CRLF で終わるファイルも末尾 1 バイトは LF なので、この 1 バイトだけで
+// LF・CRLF の双方を正しく判定できる。逆に CR 単独で終わるファイルは
+// 行として閉じていないため補完が必要になる。
+//
+// io.ReaderAt を受けるのは、読み取り量そのものをテストで固定するためでもある
+// (*os.File はこれを満たす)。
+func needsNewlinePadding(r io.ReaderAt, size int64) (bool, error) {
+	if size <= 0 {
+		// 空のファイルには「終端していない直前の行」が存在しない。
+		return false, nil
+	}
+	var last [1]byte
+	n, err := r.ReadAt(last[:], size-1)
+	if n == len(last) {
+		// io.ReaderAt は要求量を満たしたうえで io.EOF を返すことを許している。
+		// それを失敗として扱うと、正常な追記先を開けなくなる。
+		return last[0] != '\n', nil
+	}
+	if err == nil {
+		err = io.ErrUnexpectedEOF
+	}
+	return false, err
+}
+
+// closeLocked はロックを解放してファイルを閉じる(OutputManager を組み立てる前の
+// 失敗経路で使う)。失敗しても報告経路がないため best effort とする。
+func closeLocked(f *os.File) {
+	_ = unlock(f)
+	_ = f.Close()
 }
 
 // newlineOf は行の区切りに使う改行コードを返す(要件 3.3 / FR-12)。
@@ -309,7 +426,13 @@ func discardStaleTemp(outPath, tempPath string) error {
 // 改行は「区切り」として次のレコードの直前に書く。最終行の改行は Finalize が
 // TrailingNewline に従って付ける(要件 3.5 / FR-14)。この配置により、レコードが
 // 0 件のときはどちらの設定でも 1 バイトも書かれず、0 バイトのファイルが残る
-// (要件 3.10 / FR-19)。
+// (要件 3.10 / FR-19)。追記モードでも同じ理屈で、0 件の追記は既存ファイルを
+// 1 バイトも変えない(末尾改行の補完も起きない)。
+//
+// 追記モードで補完の改行をここまで遅らせるのは、design.md「output」の不変条件
+// 「ジャーナルが sync される前に追記の 1 バイト目を書かない」を満たすためでもある。
+// 補完の改行こそが追記の 1 バイト目であり、openAppend で先に書いてしまうと、
+// タスク 3.4 がジャーナルを openAppend の末尾に置いても不変条件が破れる。
 //
 // BOM は決して書かない(要件 3.4 / FR-13)。レコードは生バイトのまま素通しするため、
 // 値・数値字句・エスケープの変換も行わない(要件 3.7〜3.9)。
@@ -321,7 +444,10 @@ func (o *OutputManager) WriteRecord(compact jsontext.Value) error {
 		}
 	}
 
-	if o.wroteAny {
+	// 2 件目以降の区切りの改行と、追記モードで既存ファイルの末尾に補う改行
+	// (要件 4.5 / FR-24)は、どちらも「行を分ける 1 個の改行」であり同じ扱いでよい。
+	// padPending は最初のレコードの直前でしか参照されないため、消費後に戻す必要はない。
+	if o.wroteAny || o.padPending {
 		if _, err := o.w.WriteString(o.newline); err != nil {
 			return o.writeError(err)
 		}
@@ -336,34 +462,47 @@ func (o *OutputManager) WriteRecord(compact jsontext.Value) error {
 // writeError は書き込み失敗を終了コード 4 のエラーへ写像する
 // (design.md「Error Handling」: 出力書き込みエラー=4、stderr にパスを含む理由)。
 func (o *OutputManager) writeError(cause error) error {
+	if o.tempPath != "" {
+		return &ExitError{
+			Code: ExitOutput,
+			Err:  fmt.Errorf("出力先 %q への書き込みに失敗した(一時ファイル %q): %w", o.cfg.Out, o.tempPath, cause),
+		}
+	}
+	// 追記モードは一時ファイルを介さず出力ファイル自身へ書く。
 	return &ExitError{
 		Code: ExitOutput,
-		Err:  fmt.Errorf("出力先 %q への書き込みに失敗した(一時ファイル %q): %w", o.cfg.Out, o.tempPath, cause),
+		Err:  fmt.Errorf("出力先 %q への追記に失敗した: %w", o.cfg.Out, cause),
 	}
 }
 
 // Finalize は書き込みを確定する。新規作成モードでは
-// 最終行の改行 → Flush → Sync → unlock → Close → rename の順に進む。
+// 最終行の改行 → Flush → Sync → unlock → Close → rename の順に、
+// 追記モードでは 最終行の改行 → Flush → Sync → unlock → Close の順に進む。
 //
-// rename に成功した時点で、出力パスには完全な NDJSON だけが存在する。
+// 新規作成モードでは rename に成功した時点で、出力パスには完全な NDJSON だけが存在する。
 // 途中で失敗した場合は一時ファイルを片付けたうえでエラーを返し、出力パスには
-// 一切触れない(要件 4.2 / FR-21)。その場合は状態を「中断済み」にするので、
-// 呼び出し元が defer で Abort を重ねても二重に片付けは走らない。
+// 一切触れない(要件 4.2 / FR-21)。追記モードで途中で失敗した場合は、出力ファイルを
+// 追記開始前のサイズへ切り詰めてからエラーを返す(要件 4.9 / FR-39)。
+// いずれの場合も状態を「中断済み」にするので、呼び出し元が defer で Abort を重ねても
+// 二重に片付けは走らない。
 //
 // 確定済み・中断済みの状態で呼ばれた場合は何もしない。
 func (o *OutputManager) Finalize() error {
 	if o.state != stateOpen {
 		return nil
 	}
-	if o.mode == modeAppend {
-		// 【継ぎ目】追記モードの確定(Flush→Sync→ジャーナル削除→unlock)は
-		// タスク 3.3 / 3.4 が実装する。openOutput が追記モードの OutputManager を
-		// 返さない現時点では到達しない。
-		return errAppendNotWired("Finalize")
-	}
 
-	if err := o.commitNew(); err != nil {
-		o.cleanupNew()
+	var err error
+	if o.mode == modeAppend {
+		if err = o.commitAppend(); err != nil {
+			o.rollbackAppend()
+		}
+	} else {
+		if err = o.commitNew(); err != nil {
+			o.cleanupNew()
+		}
+	}
+	if err != nil {
 		o.state = stateAborted
 		return err
 	}
@@ -371,14 +510,52 @@ func (o *OutputManager) Finalize() error {
 	return nil
 }
 
+// finishLastLine は最終行の改行を必要に応じて書く(要件 3.5 / FR-14)。
+//
+// レコードを 1 件も書いていないときは付けない。新規作成モードでは付けてしまうと
+// 空配列の出力が 0 バイトにならず(要件 3.10)、追記モードでは 0 件の追記が既存
+// ファイルを書き換えてしまう。
+func (o *OutputManager) finishLastLine() error {
+	if !o.wroteAny || !o.cfg.TrailingNewline {
+		return nil
+	}
+	if _, err := o.w.WriteString(o.newline); err != nil {
+		return o.writeError(err)
+	}
+	return nil
+}
+
+// commitAppend は追記モードの確定手順そのもの。失敗時の切り詰めは呼び出し元が行う。
+func (o *OutputManager) commitAppend() error {
+	if err := o.finishLastLine(); err != nil {
+		return err
+	}
+	if err := o.w.Flush(); err != nil {
+		return o.writeError(err)
+	}
+	// 追記した内容をディスクへ確定させてからロックを手放す(IMPL-14)。
+	if err := o.file.Sync(); err != nil {
+		return o.writeError(err)
+	}
+
+	// 【継ぎ目】ここでジャーナル(<出力名>.journal)を削除するのがタスク 3.4。
+	// design.md「output」の不変条件「ジャーナルの存在=前回の追記が未確定」を保つには、
+	// Sync の後・ロック解放の前でなければならない。
+
+	// unlock の失敗は無視してよい。続く Close がロックを必ず解放するため、
+	// ここで失敗を理由に処理全体を止めると、書き終えた内容を捨てることになる。
+	_ = unlock(o.file)
+	o.closed = true
+	if err := o.file.Close(); err != nil {
+		return o.writeError(err)
+	}
+	return nil
+}
+
 // commitNew は新規作成モードの確定手順そのもの。失敗時の片付けは呼び出し元が行う。
 func (o *OutputManager) commitNew() error {
-	// 最終行の改行(要件 3.5 / FR-14)。レコードを 1 件も書いていないときは
-	// 付けない。付けてしまうと空配列の出力が 0 バイトにならない(要件 3.10)。
-	if o.wroteAny && o.cfg.TrailingNewline {
-		if _, err := o.w.WriteString(o.newline); err != nil {
-			return o.writeError(err)
-		}
+	if err := o.finishLastLine(); err != nil {
+		return err
 	}
 	if err := o.w.Flush(); err != nil {
 		return o.writeError(err)
@@ -415,6 +592,7 @@ func (o *OutputManager) commitNew() error {
 // 新規作成モードでは一時ファイルを削除するだけで、出力パスには一切触れない。
 // 出力パスが実行前から存在しなければ不在のままであり、`--overwrite` で既存ファイルを
 // 置換する途中だった場合は既存ファイルがそのまま残る。
+// 追記モードでは出力ファイルを追記開始前のサイズへ切り詰める(要件 4.4 / FR-23)。
 //
 // 失敗しても報告経路を持たない(design.md の署名どおり戻り値なし)。best effort で
 // 片付ける。確定済み・中断済みの状態で呼ばれた場合は何もしない。とくに
@@ -427,11 +605,47 @@ func (o *OutputManager) Abort() {
 	o.state = stateAborted
 
 	if o.mode == modeAppend {
-		// 【継ぎ目】追記モードの中断(開始前サイズへの切り詰め → ジャーナル削除 →
-		// unlock)はタスク 3.3 / 3.4 が実装する。現時点では到達しない。
+		o.rollbackAppend()
 		return
 	}
 	o.cleanupNew()
+}
+
+// rollbackAppend は追記モードの後始末。出力ファイルを追記開始前のサイズへ
+// 切り詰めてから閉じる(要件 4.4 / FR-23、4.9 / FR-39)。
+//
+// バッファに残った未書き出しのバイトは破棄する(Flush しない)。中断は「書きかけを
+// 無かったことにする」処理であり、ここで書き足す理由はない。
+//
+// 出力ファイル自体は削除しない。`--append` で新規作成した場合の開始前サイズは 0 で
+// あり、0 バイトへの切り詰めが要件 4.9 の定める復元そのものである。削除は「自分が
+// 作ったのか、開いた瞬間に他者が作ったのか」を区別できないまま他者のデータを消しうる
+// (新規作成モードの Abort が出力パスに触れないのと同じ判断)。
+func (o *OutputManager) rollbackAppend() {
+	truncated := false
+	if o.file != nil && !o.closed {
+		// ハンドル経由で切り詰める。ロックを保持したまま行うため、Windows でも
+		// 他プロセスに割り込まれない。
+		if err := o.file.Truncate(o.baseSize); err == nil {
+			truncated = true
+		}
+	}
+	// Windows ではハンドルを閉じるまでロックが残る。以降の os.Truncate のためにも
+	// 先に閉じる。
+	o.closeFile()
+
+	if !truncated {
+		// ハンドルが使えない状態(確定手順の途中で閉じた後の失敗、書き込み失敗で
+		// ディスクリプタが無効になった場合など)でも、開始前サイズへ戻すことは
+		// 諦めずパス経由で試みる。Abort は戻り値を持たない best effort の処理であり
+		// (design.md の署名どおり)、ここで失敗しても報告経路はない。
+		// プロセスごと強制終了された場合の復旧は、タスク 3.4 のジャーナルが担う。
+		_ = os.Truncate(o.cfg.Out, o.baseSize)
+	}
+
+	// 【継ぎ目】ここでジャーナル(<出力名>.journal)を削除するのがタスク 3.4。
+	// 切り詰めが済んだ後に削除しなければ、削除と切り詰めの間で強制終了された場合に
+	// 復旧の手がかりが失われる。
 }
 
 // cleanupNew は新規作成モードの後始末。一時ファイルを閉じて削除するだけで、

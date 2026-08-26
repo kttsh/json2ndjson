@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -609,33 +610,608 @@ func TestOpenOutputFailsWhenDirectoryMissing(t *testing.T) {
 	}
 }
 
-// TestOpenOutputAppendModeIsNotWiredYet は、追記モードがこのタスクの範囲外で
-// あることを明示的に固定する見張り番である。
+// ---------------------------------------------------------------------------
+// 追記モード(タスク 3.3)
 //
-// タスク 3.2 は新規作成モードのみを実装する。追記モード(タスク 3.3)と
-// ジャーナル復旧(タスク 3.4)を結線したら、このテストは失敗するので、
-// そのとき追記モードの本来のテストへ置き換えること。
-// 未実装の経路が「出力書き込みエラー(4)」を装って呼び出し元のリトライ判断を
-// 誤らせないよう、終了コードは内部エラー(9)であることも固定する。
-func TestOpenOutputAppendModeIsNotWiredYet(t *testing.T) {
-	dir := t.TempDir()
-	cfg := newOutputConfig(filepath.Join(dir, "out.ndjson"))
-	cfg.Append = true
+// タスク 3.2 が置いていた見張り番 TestOpenOutputAppendModeIsNotWiredYet
+// (追記が未結線であることを固定するテスト)は、以下の本来のテスト群で
+// 置き換えた(tasks.md「未配線の契約」の指示)。
+// ---------------------------------------------------------------------------
 
-	om, err := openOutput(cfg)
-	if om != nil {
-		t.Fatal("追記モードは未実装だが OutputManager が返った(タスク 3.3 を実装したらこのテストを置き換える)")
+// newAppendConfig は追記モード(--append)の最小構成を返す。
+func newAppendConfig(out string) *Config {
+	cfg := newOutputConfig(out)
+	cfg.Append = true
+	return cfg
+}
+
+// writeExisting は追記先の既存ファイルを用意する。
+func writeExisting(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("既存ファイル %q を準備できない: %v", path, err)
 	}
-	if code := exitCodeOf(t, err); code != ExitInternal {
-		t.Errorf("未結線の追記モードの終了コードが %d。内部エラー %d でなければならない", code, ExitInternal)
+}
+
+// bigRecord は書き込みバッファ(writeBufferSize)を必ず超える大きさのレコードを返す。
+// bufio.Writer はバッファに収まらない書き込みを下位ファイルへ直接流すため、これを
+// 書くと追記が実際にファイルへ届き、ファイルが開始前サイズより大きくなる。
+// ロールバックのテストは「本当に伸びたファイルを戻す」ことを確かめる必要がある。
+func bigRecord(tag string) string {
+	return `{"` + tag + `":"` + strings.Repeat("x", 2*writeBufferSize) + `"}`
+}
+
+// TestFinalizeAppendWritesExactBytes は、追記モードの結果バイト列を
+// 「既存ファイルの末尾(改行あり/なし/空/不在)」×「改行コード(要件 3.3)」×
+// 「最終行改行(要件 3.5)」×「追記件数 0/1/N」の組み合わせで固定する。
+//
+// 要件 4.3(既存がなければ新規作成して追記扱い)、要件 4.5(末尾が改行で
+// 終わっていなければ改行を補ってから追記)をバイト単位で押さえる。
+// 改行を補わない実装は「行の連結」として、逆に無条件で補う実装は「空行の挿入」として、
+// ここで必ず落ちる。
+func TestFinalizeAppendWritesExactBytes(t *testing.T) {
+	tests := []struct {
+		name     string
+		noFile   bool // 追記先が存在しない(要件 4.3)
+		existing string
+		newline  string
+		trailing bool
+		records  []string
+		want     string
+	}{
+		{
+			name: "末尾が改行でない既存へ 1 件・LF・最終行改行あり",
+			// 補完を怠ると `{"旧":1}{"新":1}` という 1 行に連結された不正な NDJSON になる。
+			existing: `{"旧":1}`, newline: "\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"旧\":1}\n{\"新\":1}\n",
+		},
+		{
+			name:     "末尾が改行の既存へ 1 件・LF・最終行改行あり(空行を挿入しない)",
+			existing: "{\"旧\":1}\n", newline: "\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"旧\":1}\n{\"新\":1}\n",
+		},
+		{
+			name:     "空(0 バイト)の既存へ 1 件(先頭に改行を置かない)",
+			existing: "", newline: "\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"新\":1}\n",
+		},
+		{
+			name:   "既存ファイルがない場合は新規作成して追記扱い(要件 4.3)",
+			noFile: true, newline: "\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"新\":1}\n",
+		},
+		{
+			name:     "末尾が改行でない既存へ 3 件・LF・最終行改行あり",
+			existing: `{"旧":1}`, newline: "\n", trailing: true,
+			records: []string{`{"a":1}`, `{"a":2}`, `{"a":3}`},
+			want:    "{\"旧\":1}\n{\"a\":1}\n{\"a\":2}\n{\"a\":3}\n",
+		},
+		{
+			name:     "末尾が改行でない既存へ 1 件・LF・最終行改行なし",
+			existing: `{"旧":1}`, newline: "\n", trailing: false,
+			records: []string{`{"新":1}`},
+			want:    "{\"旧\":1}\n{\"新\":1}",
+		},
+		{
+			name:     "末尾が改行でない既存へ 3 件・LF・最終行改行なし",
+			existing: `{"旧":1}`, newline: "\n", trailing: false,
+			records: []string{`{"a":1}`, `{"a":2}`, `{"a":3}`},
+			want:    "{\"旧\":1}\n{\"a\":1}\n{\"a\":2}\n{\"a\":3}",
+		},
+		{
+			name: "末尾が改行でない既存へ 2 件・CRLF(補完も CRLF)",
+			// 補完に LF を使う実装はここで落ちる(要件 3.3 は行の改行コードを設定に従わせる)。
+			existing: `{"旧":1}`, newline: "\r\n", trailing: true,
+			records: []string{`{"a":1}`, `{"a":2}`},
+			want:    "{\"旧\":1}\r\n{\"a\":1}\r\n{\"a\":2}\r\n",
+		},
+		{
+			name:     "末尾が CRLF の既存へ 1 件・CRLF(補完しない)",
+			existing: "{\"旧\":1}\r\n", newline: "\r\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"旧\":1}\r\n{\"新\":1}\r\n",
+		},
+		{
+			name:     "末尾が CRLF の既存へ 2 件・CRLF・最終行改行なし",
+			existing: "{\"旧\":1}\r\n", newline: "\r\n", trailing: false,
+			records: []string{`{"a":1}`, `{"a":2}`},
+			want:    "{\"旧\":1}\r\n{\"a\":1}\r\n{\"a\":2}",
+		},
+		{
+			name: "末尾が CR 単独の既存へ 1 件・LF(CR は行終端とみなさない)",
+			// 末尾 1 バイトが '\r' のファイルは改行で終わっていない。補完しなければ
+			// `{"旧":1}\r{"新":1}` となり、NDJSON の 1 行に 2 レコードが乗る。
+			existing: "{\"旧\":1}\r", newline: "\n", trailing: true,
+			records: []string{`{"新":1}`},
+			want:    "{\"旧\":1}\r\n{\"新\":1}\n",
+		},
+		{
+			name: "末尾が改行でない既存へ 0 件(1 バイトも変えない)",
+			// 補完の改行は「既存の行と追記した行を分ける」ためのもの。追記する行が
+			// なければ分けるものもなく、要件 4.5 の補完は発生しない(要件 3.10 の
+			// 「0 件でも正常終了」を追記モードで具体化したもの)。
+			existing: `{"旧":1}`, newline: "\n", trailing: true,
+			records: nil,
+			want:    `{"旧":1}`,
+		},
+		{
+			name:     "末尾が改行でない既存へ 0 件・最終行改行なし(1 バイトも変えない)",
+			existing: `{"旧":1}`, newline: "\n", trailing: false,
+			records: nil,
+			want:    `{"旧":1}`,
+		},
+		{
+			name:   "既存ファイルがない場合の 0 件は 0 バイトのファイルになる",
+			noFile: true, newline: "\n", trailing: true,
+			records: nil,
+			want:    "",
+		},
+		{
+			name:     "日本語・絵文字・エスケープを含むレコードを素通しする",
+			existing: `{"旧":1}`, newline: "\n", trailing: true,
+			records: []string{`{"名前":"山田 太郎","絵文字":"😀","改行":"a\nb"}`},
+			want:    "{\"旧\":1}\n{\"名前\":\"山田 太郎\",\"絵文字\":\"😀\",\"改行\":\"a\\nb\"}\n",
+		},
 	}
-	// 未実装の経路がファイルへ触れていないこと。
-	entries, err := os.ReadDir(dir)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			out := filepath.Join(dir, "out.ndjson")
+			if !tt.noFile {
+				writeExisting(t, out, tt.existing)
+			}
+
+			cfg := newAppendConfig(out)
+			cfg.Newline = tt.newline
+			cfg.TrailingNewline = tt.trailing
+
+			om := mustOpenOutput(t, cfg)
+			writeRecords(t, om, tt.records...)
+			if err := om.Finalize(); err != nil {
+				t.Fatalf("Finalize が失敗した: %v", err)
+			}
+
+			got := readOutput(t, out)
+			if string(got) != tt.want {
+				t.Errorf("追記後のバイト列が期待と異なる\n got=%q\nwant=%q", got, tt.want)
+			}
+			if bytes.HasPrefix(got, utf8BOM) {
+				t.Error("出力の先頭に BOM が書かれている(要件 3.4 は BOM なし UTF-8)")
+			}
+			// 追記モードは一時ファイルを使わない(出力ファイル自身をロックして追記する)。
+			assertNotExist(t, tempPathOf(out), "一時ファイル")
+		})
+	}
+}
+
+// TestAbortAfterPartialAppendRestoresPreAppendSize は、追記の途中で中断したときに
+// 既存ファイルが開始前のサイズ・内容へ戻ることを検証する
+// (要件 4.4 / FR-23、要件 4.9 / FR-39、タスク 3.3 の完了条件、
+// design.md「Testing Strategy / Integration Tests」2)。
+//
+// 中断は main の defer が担う経路そのもの(変換側の失敗=終了コード 2/3/5 など)を
+// 模している。バッファを超える大きさのレコードを書くことで、中断前にバイトが
+// 実際にファイルへ届いている状態を作る。届いていなければ切り詰めが無くても
+// テストが通ってしまうため、伸びたこと自体もアサートする。
+func TestAbortAfterPartialAppendRestoresPreAppendSize(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = `{"既存":"末尾に改行がない行"}`
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, bigRecord("a"), bigRecord("b"))
+
+	info, err := os.Stat(out)
 	if err != nil {
-		t.Fatalf("出力ディレクトリを列挙できない: %v", err)
+		t.Fatalf("追記中のファイルを stat できない: %v", err)
 	}
-	if len(entries) != 0 {
-		t.Errorf("未結線の追記モードがファイルを作成した: %v", entries)
+	if info.Size() <= int64(len(original)) {
+		t.Fatalf("テストの前提が崩れている(追記がまだファイルへ届いていない): size=%d", info.Size())
+	}
+
+	om.Abort()
+
+	got := readOutput(t, out)
+	if string(got) != original {
+		t.Errorf("中断後の内容が開始前と異なる(切り詰めが効いていない)\n size=%d want_size=%d\n got(先頭 80 バイト)=%q\nwant=%q",
+			len(got), len(original), got[:min(len(got), 80)], original)
+	}
+}
+
+// TestWriteRecordFailureDuringAppendRestoresFile は、追記中の書き込み失敗が
+// 終了コード 4 で報告され、その後の中断で既存ファイルが開始前サイズへ戻ることを
+// 検証する(要件 4.4 / FR-23、要件 4.9 / FR-39)。
+//
+// 失敗の注入はタスク 3.2 と同じ「下位のファイルハンドルを閉じてから、バッファを
+// 超える大きさのレコードを書く」方式で、OS が返す本物のエラーを経路に通す。
+// 閉じたあとはハンドル経由の切り詰めができないため、パス経由の切り詰めまで含めて
+// 復元されることをここで固定する。
+func TestWriteRecordFailureDuringAppendRestoresFile(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = `{"既存":"この内容は失敗後も残らねばならない"}`
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, bigRecord("a"))
+
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("追記中のファイルを stat できない: %v", err)
+	}
+	if info.Size() <= int64(len(original)) {
+		t.Fatalf("テストの前提が崩れている(追記がまだファイルへ届いていない): size=%d", info.Size())
+	}
+
+	if err := om.file.Close(); err != nil {
+		t.Fatalf("失敗注入のためのクローズができない: %v", err)
+	}
+
+	err = om.WriteRecord(jsontext.Value(bigRecord("b")))
+	if err == nil {
+		t.Fatal("閉じたファイルへの追記が成功として報告された")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("追記失敗の終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	if !strings.Contains(err.Error(), out) {
+		t.Errorf("エラーメッセージに出力パスが含まれない: %v", err)
+	}
+
+	om.Abort()
+
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("書き込み失敗後の中断で開始前の状態へ戻っていない\n size=%d want_size=%d", len(got), len(original))
+	}
+}
+
+// TestFinalizeFailureDuringAppendRestoresFile は、追記の確定手順(Flush→Sync→
+// unlock→Close)の途中で失敗したときも、既存ファイルが開始前サイズへ戻ることを
+// 検証する(要件 4.9 / FR-39)。確定に失敗したのに伸びたままのファイルを残す実装、
+// 失敗を検出せず成功を返す実装はここで落ちる。
+func TestFinalizeFailureDuringAppendRestoresFile(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = "{\"既存\":\"確定失敗後も残る\"}\n"
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, bigRecord("a"))
+
+	if err := om.file.Close(); err != nil {
+		t.Fatalf("失敗注入のためのクローズができない: %v", err)
+	}
+
+	err := om.Finalize()
+	if err == nil {
+		t.Fatal("閉じたハンドルに対する Finalize が成功として報告された")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("確定失敗の終了コードが %d。%d でなければならない", code, ExitOutput)
+	}
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("確定失敗後に開始前の状態へ戻っていない\n size=%d want_size=%d", len(got), len(original))
+	}
+
+	// 確定に失敗した後は中断済み。main の defer が Abort を重ねても壊れない。
+	om.Abort()
+	if got := readOutput(t, out); string(got) != original {
+		t.Errorf("確定失敗+中断の重ね掛けで内容が変わった\n got=%q\nwant=%q", got, original)
+	}
+}
+
+// TestAbortAfterAppendFinalizeKeepsCommittedContent は、確定に成功した後で Abort が
+// 呼ばれても、追記済みの内容が切り詰められないことを検証する。
+//
+// main は `defer om.Abort()` で異常終了経路を守るため、正常系でも Finalize の直後に
+// Abort が走る。中断処理が状態を見ずに開始前サイズへ切り詰めると、確定した追記が
+// 毎回消えるという最悪の事故になる。
+func TestAbortAfterAppendFinalizeKeepsCommittedContent(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = "{\"旧\":1}\n"
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, `{"新":1}`)
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	om.Abort()
+	om.Abort() // 二重呼び出しでも壊れないこと
+
+	const want = "{\"旧\":1}\n{\"新\":1}\n"
+	if got := readOutput(t, out); string(got) != want {
+		t.Errorf("確定後の Abort で追記内容が失われた\n got=%q\nwant=%q", got, want)
+	}
+}
+
+// TestAbortOnNewlyCreatedAppendTargetLeavesEmptyFile は、`--append` で新規作成した
+// ファイルを中断したときの状態を固定する。
+//
+// 【判断】要件 4.9 / FR-39 は追記モードの復元先を「追記開始前のサイズ」と定める。
+// 新規作成した場合その値は 0 であり、0 バイトへの切り詰めが規定どおりの復元である。
+// ファイル自体の削除は行わない。理由は 2 つ:
+//   - 要件 4.3 / FR-22 は「既存ファイルが存在しなければ新規作成する」と定めており、
+//     ファイルの存在は追記モードが正規に作った開始前状態の一部である。
+//   - 削除は「自分が作ったのか、開いた瞬間に他者が作ったのか」を区別できないまま
+//     他者のデータを消しうる。タスク 3.2 の Abort が出力パスを削除しないと決めた
+//     判断(tasks.md「タスク 3.2 が確定した output の契約」)と同じ理由である。
+func TestAbortOnNewlyCreatedAppendTargetLeavesEmptyFile(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, bigRecord("a"))
+	om.Abort()
+
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("追記モードで作成したファイルは中断後も残らねばならない: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("中断後のサイズが %d。開始前サイズ(0)でなければならない", info.Size())
+	}
+}
+
+// TestAppendToLargeExistingFile は、大きな既存ファイル(末尾は改行なし)への追記が
+// 正しく行われることを検証する。末尾判定のためにファイル全体を読む実装でも結果は
+// 同じになるため、「末尾 1 バイトしか読まない」ことの証明は
+// TestNeedsNewlinePaddingReadsOnlyLastByte が読み取り回数で行う。
+// こちらは大きな既存内容が 1 バイトも書き換わらないことを担保する。
+func TestAppendToLargeExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	original := strings.Repeat("{\"旧\":\"0123456789012345678901234567890123456789\"}\n", 8192) +
+		`{"旧":"末尾に改行がない行"}`
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, `{"新":1}`)
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	want := original + "\n" + `{"新":1}` + "\n"
+	got := readOutput(t, out)
+	if string(got) != want {
+		t.Errorf("大きな既存ファイルへの追記結果が期待と異なる(size got=%d want=%d)",
+			len(got), len(want))
+	}
+}
+
+// countingReaderAt は ReadAt の呼び出し回数・読み取りバイト数・オフセットを記録する
+// io.ReaderAt。末尾判定が「ファイル全体を読む」実装へ退行したことを検出するために使う。
+type countingReaderAt struct {
+	data    []byte
+	calls   int
+	read    int
+	offsets []int64
+	// eofWithData を立てると、末尾まで読み切った呼び出しで (n, io.EOF) を返す。
+	// io.ReaderAt はこの返し方を許しており(n == len(p) でも EOF を返してよい)、
+	// これをエラー扱いする実装は追記を開始できなくなる。
+	eofWithData bool
+	// err を立てると常にこのエラーを返す(読み取り失敗の経路の検証用)。
+	err error
+}
+
+func (c *countingReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	c.calls++
+	c.offsets = append(c.offsets, off)
+	if c.err != nil {
+		return 0, c.err
+	}
+	if off < 0 || off >= int64(len(c.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data[off:])
+	c.read += n
+	if c.eofWithData || n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// TestNeedsNewlinePaddingReadsOnlyLastByte は、末尾改行の判定が
+//   - 正しい真偽値を返すこと
+//   - 読み取るのが末尾 1 バイトだけであること(design.md「末尾 1 バイトのみ読む」、
+//     要件 4.5 / FR-24)
+//
+// を検証する。300 MB 級の追記先を毎回読み直す実装への退行を、読み取りバイト数の
+// アサーションで捕まえる。
+func TestNeedsNewlinePaddingReadsOnlyLastByte(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      string
+		want      bool
+		wantCalls int
+		wantRead  int
+	}{
+		{"末尾が } なら補完が必要", `{"a":1}`, true, 1, 1},
+		{"末尾が LF なら補完は不要", "{\"a\":1}\n", false, 1, 1},
+		{"末尾が CRLF でも最後の 1 バイトは LF なので不要", "{\"a\":1}\r\n", false, 1, 1},
+		{"末尾が CR 単独なら補完が必要", "{\"a\":1}\r", true, 1, 1},
+		{"0 バイトなら 1 バイトも読まずに不要と判定する", "", false, 0, 0},
+		{"途中に改行があっても末尾だけで判定する", "a\nb\nc", true, 1, 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &countingReaderAt{data: []byte(tt.data)}
+			got, err := needsNewlinePadding(r, int64(len(tt.data)))
+			if err != nil {
+				t.Fatalf("needsNewlinePadding が失敗した: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("判定が %v。%v でなければならない", got, tt.want)
+			}
+			if r.calls != tt.wantCalls {
+				t.Errorf("ReadAt の呼び出しが %d 回。%d 回でなければならない", r.calls, tt.wantCalls)
+			}
+			if r.read != tt.wantRead {
+				t.Errorf("読み取りが %d バイト。%d バイトでなければならない(末尾 1 バイトのみを読む)",
+					r.read, tt.wantRead)
+			}
+			if tt.wantCalls > 0 {
+				if want := int64(len(tt.data) - 1); r.offsets[0] != want {
+					t.Errorf("読み取りオフセットが %d。末尾の %d でなければならない", r.offsets[0], want)
+				}
+			}
+		})
+	}
+}
+
+// TestNeedsNewlinePaddingAcceptsEOFWithData は、末尾 1 バイトを読み切った呼び出しが
+// (1, io.EOF) を返す ReaderAt でも判定が成立することを検証する。
+// io.ReaderAt の契約は n == len(p) のときに EOF を返すことを許しており、これを
+// 失敗として扱うと追記が「末尾 1 バイトを読めない」で終了コード 4 になる。
+func TestNeedsNewlinePaddingAcceptsEOFWithData(t *testing.T) {
+	r := &countingReaderAt{data: []byte(`{"a":1}`), eofWithData: true}
+	got, err := needsNewlinePadding(r, int64(len(r.data)))
+	if err != nil {
+		t.Fatalf("(n, io.EOF) を返す ReaderAt で失敗した: %v", err)
+	}
+	if !got {
+		t.Error("末尾が } なので補完が必要と判定されねばならない")
+	}
+}
+
+// TestNeedsNewlinePaddingReportsReadFailure は、末尾 1 バイトを読めない場合に
+// エラーが握り潰されないことを検証する。ここで nil を返すと、読めなかっただけの
+// ファイルに対して「改行あり」とみなして行を連結してしまう。
+func TestNeedsNewlinePaddingReportsReadFailure(t *testing.T) {
+	want := errors.New("読み取り失敗")
+	r := &countingReaderAt{data: []byte(`{"a":1}`), err: want}
+	if _, err := needsNewlinePadding(r, int64(len(r.data))); !errors.Is(err, want) {
+		t.Errorf("読み取り失敗が伝播しない: %v", err)
+	}
+}
+
+// TestOpenAppendRefusesLockedOutputFile は、同じ出力ファイルを処理中の別プロセスが
+// いる場合に終了コード 4 で停止することを検証する(要件 4.6 / FR-25)。
+// 追記モードのロック対象は一時ファイルではなく出力ファイル自身である
+// (design.md「output」の「排他」)。
+//
+// 【この環境での限界】非 Windows の tryLock は no-op で常に成功するため、この分岐は
+// 原理的に到達できない(tasks.md「未配線の契約」: タスク 3.3 は Linux 上で
+// 「同時実行 → 終了コード 4」を検証済みと主張してはならない)。要件 4.6 の実体は
+// Windows 受け入れテストで担保する。
+func TestOpenAppendRefusesLockedOutputFile(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("非 Windows の tryLock は no-op のため、ロック済みの出力ファイルを再現できない(要件 4.6 は Windows 受け入れテストで担保)")
+	}
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	writeExisting(t, out, "{\"旧\":1}\n")
+
+	holder, err := os.OpenFile(out, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("出力ファイルを開けない: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if err := tryLock(holder); err != nil {
+		t.Fatalf("テスト側のロック取得に失敗した: %v", err)
+	}
+	defer func() { _ = unlock(holder) }()
+
+	om, err := openOutput(newAppendConfig(out))
+	if om != nil {
+		t.Error("ロック済みの出力ファイルがあるのに OutputManager が返った")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。同時実行の排他は %d でなければならない", code, ExitOutput)
+	}
+	if !errors.Is(err, ErrLocked) {
+		t.Errorf("ErrLocked が errors.Is で辿れない(%%w で包んでいない): %v", err)
+	}
+}
+
+// TestAppendPathWithSpacesAndJapanese は、空白と日本語を含む絶対パスへの追記が
+// 成立することを検証する(要件 4.1 / FR-20)。
+func TestAppendPathWithSpacesAndJapanese(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "出力 先 ディレクトリ")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("日本語ディレクトリを作成できない: %v", err)
+	}
+	out := filepath.Join(dir, "取込 結果 データ.ndjson")
+	if !filepath.IsAbs(out) {
+		t.Fatalf("テストの前提が崩れている(絶対パスではない): %q", out)
+	}
+	const original = `{"既存":"改行なし"}`
+	writeExisting(t, out, original)
+
+	om := mustOpenOutput(t, newAppendConfig(out))
+	writeRecords(t, om, `{"名前":"山田 太郎"}`)
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	want := original + "\n" + "{\"名前\":\"山田 太郎\"}\n"
+	if got := readOutput(t, out); string(got) != want {
+		t.Errorf("内容が期待と異なる\n got=%q\nwant=%q", got, want)
+	}
+}
+
+// TestOpenAppendFailsWhenDirectoryMissing は、追記先のディレクトリが存在しない場合に
+// 終了コード 4 でパス付きのエラーになることを検証する
+// (design.md「Error Handling」: 出力書き込みエラー=4、stderr にパスを含む理由)。
+func TestOpenAppendFailsWhenDirectoryMissing(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "存在しない", "out.ndjson")
+
+	om, err := openOutput(newAppendConfig(out))
+	if om != nil {
+		t.Error("ディレクトリがないのに OutputManager が返った")
+	}
+	if code := exitCodeOf(t, err); code != ExitOutput {
+		t.Errorf("終了コードが %d。出力書き込みエラーは %d でなければならない", code, ExitOutput)
+	}
+	if !strings.Contains(err.Error(), out) {
+		t.Errorf("エラーメッセージに出力パスが含まれない: %v", err)
+	}
+}
+
+// TestRunConversionAppendsThroughOutputManager は、実際の変換器(convert)を
+// 書き込み元に据えた追記が、既存内容を保ったまま golden と一致することを検証する
+// (design.md「Testing Strategy / Integration Tests」2)。
+//
+// convert は同じバッファを使い回してレコードを渡してくる(tasks.md「未配線の契約」の
+// 寿命契約)。追記経路でもそのスライスを保持していないことがここで露見する。
+func TestRunConversionAppendsThroughOutputManager(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	const original = `{"既存":"改行なしで終わる"}`
+	writeExisting(t, out, original)
+
+	cfg := newAppendConfig(out)
+	cfg.Inputs = []string{fixture("numbers.json")}
+
+	om := mustOpenOutput(t, cfg)
+	res, err := runConversion(cfg, om, nil)
+	if err != nil {
+		t.Fatalf("runConversion が失敗した: %v", err)
+	}
+	if err := om.Finalize(); err != nil {
+		t.Fatalf("Finalize が失敗した: %v", err)
+	}
+
+	golden, err := os.ReadFile(fixture("numbers.ndjson"))
+	if err != nil {
+		t.Fatalf("golden を読めない: %v", err)
+	}
+	want := append([]byte(original+"\n"), golden...)
+	if got := readOutput(t, out); !bytes.Equal(got, want) {
+		t.Errorf("追記結果が期待と異なる\n got=%q\nwant=%q", got, want)
+	}
+	if res.Records != 11 {
+		t.Errorf("出力件数が %d。golden の行数と一致しなければならない", res.Records)
 	}
 }
 
