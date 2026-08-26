@@ -103,22 +103,46 @@ func generateArray(t *testing.T, path string, target int64, payload string) (siz
 	return size, records
 }
 
-// measurePeakHeap は fn の実行中の runtime.MemStats.HeapAlloc のピークを返す(TEST-03)。
+// heapMeasurement は measurePeakHeap の計測結果。
 //
-// 計測前に GC を走らせ、直前のテストが残したごみをピークに数えないようにする。
-// fn の終了直後にもう一度読むことで、最後の採取から終了までの間に伸びた分も拾う。
-func measurePeakHeap(t *testing.T, fn func()) uint64 {
+// 絶対値(Peak)と増分(Delta)を使い分ける。要件 9.2 / NFR-02 の上限 256 MB は
+// プロセス全体のメモリに対する上限なので絶対値で見る。一方「1 レコードあたり
+// いくら使うか」を測るときは増分で見る。テストプロセスは同じプロセス内で
+// 他のテストの後に走るため、絶対値には直前のテストが残したヒープが混ざり、
+// レコードが小さいほど倍率が過大に出るためである(実測: 8 MiB のレコードが
+// 単独実行では 5.0x、全テスト実行では 8.0x に見えた)。
+type heapMeasurement struct {
+	// Baseline は計測開始時(GC 直後)の HeapAlloc。
+	Baseline uint64
+	// Peak は計測中の HeapAlloc の最大値。Baseline 以上であることが保証される。
+	Peak uint64
+}
+
+// Delta は計測対象が上積みしたヒープの量。
+func (m heapMeasurement) Delta() uint64 { return m.Peak - m.Baseline }
+
+// measurePeakHeap は fn の実行中の runtime.MemStats.HeapAlloc のピークを測る(TEST-03)。
+//
+// 計測前に GC を 2 回走らせ、直前のテストが残したごみとファイナライザ待ちを片付けてから
+// ベースラインを取る。fn の終了直後にもう一度読むことで、最後の採取から終了までの間に
+// 伸びた分も拾う。
+func measurePeakHeap(t *testing.T, fn func()) heapMeasurement {
 	t.Helper()
 
 	runtime.GC()
+	runtime.GC()
+
+	var base runtime.MemStats
+	runtime.ReadMemStats(&base)
+	baseline := base.HeapAlloc
 
 	var peak atomic.Uint64
+	peak.Store(baseline)
 	sample := func() {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
 		peak.Store(max(peak.Load(), ms.HeapAlloc))
 	}
-	sample()
 
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -140,7 +164,7 @@ func measurePeakHeap(t *testing.T, fn func()) uint64 {
 	close(done)
 	wg.Wait()
 	sample()
-	return peak.Load()
+	return heapMeasurement{Baseline: baseline, Peak: peak.Load()}
 }
 
 // resultRecords は結果行から records の値を取り出す。
@@ -181,7 +205,7 @@ func TestPerf300MB(t *testing.T) {
 		stderr  string
 		elapsed time.Duration
 	)
-	peak := measurePeakHeap(t, func() {
+	mem := measurePeakHeap(t, func() {
 		start := time.Now()
 		code, stdout, stderr = runCLI(t, "--in", in, "--out", out)
 		elapsed = time.Since(start)
@@ -203,16 +227,16 @@ func TestPerf300MB(t *testing.T) {
 		(2 * elapsed).Round(time.Second))
 
 	// メモリのピーク(要件 9.2 / NFR-02)。
-	t.Logf("ヒープのピーク: %s(入力 %s の %.1f%%)", mib(peak), mib(uint64(size)), 100*float64(peak)/float64(size))
-	if peak > memoryLimitBytes {
-		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(peak), mib(memoryLimitBytes))
+	t.Logf("ヒープのピーク: %s(入力 %s の %.1f%%)", mib(mem.Peak), mib(uint64(size)), 100*float64(mem.Peak)/float64(size))
+	if mem.Peak > memoryLimitBytes {
+		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(mem.Peak), mib(memoryLimitBytes))
 	}
 	// ストリーミング処理の証拠(要件 9.1 / NFR-01)。入力全体をメモリに展開する
 	// 実装ならピークは入力サイズ以上になる。上限 256 MB は 300 MB 入力に対して
 	// わずかに小さいだけなので、それだけでは「展開していない」ことの証明として弱い。
-	if half := uint64(size) / 2; peak > half {
+	if half := uint64(size) / 2; mem.Peak > half {
 		t.Errorf("ヒープのピーク %s が入力の半分 %s を超えた。入力をストリーミングで処理していない疑いがある(要件 9.1 / NFR-01)",
-			mib(peak), mib(half))
+			mib(mem.Peak), mib(half))
 	}
 }
 
@@ -240,13 +264,13 @@ func TestPerfMemoryIsIndependentOfInputSize(t *testing.T) {
 		generateArray(t, in, target, strings.Repeat("y", 128))
 		var code int
 		var stderr string
-		peak := measurePeakHeap(t, func() {
+		mem := measurePeakHeap(t, func() {
 			code, _, stderr = runCLI(t, "--in", in, "--out", out)
 		})
 		if code != ExitOK {
 			t.Fatalf("終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
 		}
-		return peak
+		return mem.Peak
 	}
 
 	peakSmall := measure(small)
@@ -301,7 +325,7 @@ func TestPerfHugeRecordExceedsLimit(t *testing.T) {
 		stdout string
 		stderr string
 	)
-	peak := measurePeakHeap(t, func() {
+	mem := measurePeakHeap(t, func() {
 		code, stdout, stderr = runCLI(t, "--in", in, "--out", out, "--max-record-bytes", "1048576")
 	})
 
@@ -319,9 +343,9 @@ func TestPerfHugeRecordExceedsLimit(t *testing.T) {
 		t.Errorf("異常終了後に出力ファイルが残っている: err = %v", err)
 	}
 
-	t.Logf("ヒープのピーク: %s(巨大レコード 32.0 MiB)", mib(peak))
-	if peak > memoryLimitBytes {
-		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(peak), mib(memoryLimitBytes))
+	t.Logf("ヒープのピーク: %s(巨大レコード 32.0 MiB)", mib(mem.Peak))
+	if mem.Peak > memoryLimitBytes {
+		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(mem.Peak), mib(memoryLimitBytes))
 	}
 }
 
@@ -340,7 +364,7 @@ func TestPerfHugeRecordSkippedWithWarning(t *testing.T) {
 		stdout string
 		stderr string
 	)
-	peak := measurePeakHeap(t, func() {
+	mem := measurePeakHeap(t, func() {
 		code, stdout, stderr = runCLI(t, "--in", in, "--out", out,
 			"--max-record-bytes", "1048576", "--skip-oversize")
 	})
@@ -363,14 +387,15 @@ func TestPerfHugeRecordSkippedWithWarning(t *testing.T) {
 		t.Errorf("出力ファイル = %q, want %q(巨大レコードは含まれない)", got, want)
 	}
 
-	t.Logf("ヒープのピーク: %s(巨大レコード 32.0 MiB)", mib(peak))
-	if peak > memoryLimitBytes {
-		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(peak), mib(memoryLimitBytes))
+	t.Logf("ヒープのピーク: %s(巨大レコード 32.0 MiB)", mib(mem.Peak))
+	if mem.Peak > memoryLimitBytes {
+		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(mem.Peak), mib(memoryLimitBytes))
 	}
 }
 
-// recordHeapMultiplierLimit は 1 レコードのバイト数に対するヒープのピークの倍率の
-// 許容上限。実測は 5.0 倍で厳密に線形(TestPerfRecordHeapMultiplier が報告する)。
+// recordHeapMultiplierLimit は 1 レコードのバイト数に対するヒープの増分の倍率の
+// 許容上限。実測は 5.0 倍で、全テスト実行を 5 回繰り返しても変わらない
+// (TestPerfRecordHeapMultiplier が報告する)。
 //
 // この値は「現状の実装がこうである」ことを固定する回帰検知用であり、要件が定めた
 // ものではない。倍率が上がると要件 9.2 / NFR-02 の 256 MB を破るレコードサイズが
@@ -384,9 +409,13 @@ const recordHeapMultiplierLimit = 8.0
 //
 // # 報告する事実(タスク 6.1 の計測で判明)
 //
-// ヒープのピークはレコードのバイト数の約 5.0 倍で、8 / 16 / 32 / 64 MiB のいずれでも
-// 倍率は変わらない。したがって要件 9.2 の上限 256 MB を破るのは 1 レコードが
-// おおよそ 51 MiB(= 256 / 5)を超えたときである。
+// ヒープの増分(ベースラインからの上積み)はレコードのバイト数の約 5.0 倍で、
+// 8 / 16 / 32 / 64 MiB のいずれでも倍率は変わらない。したがって要件 9.2 の上限
+// 256 MB を破るのは 1 レコードがおおよそ 51 MiB(= 256 / 5)を超えたときである。
+//
+// 倍率は増分で測る。絶対値のピークで測ると同一プロセス内の他テストが残したヒープが
+// 混ざり、レコードが小さいほど倍率が過大に出る(8 MiB のレコードが単独実行では
+// 5.0x、全テスト実行では 8.0x に見えた)。heapMeasurement の説明も参照。
 //
 // これは要件 9.2 と NFR-04 の間の緊張として記録に値する。NFR-04 は受け側の行長制限の
 // 例として「BigQuery の JSON ロードは 1 行 100 MB」を挙げており、100 MB のレコードは
@@ -411,17 +440,17 @@ func TestPerfRecordHeapMultiplier(t *testing.T) {
 			code   int
 			stderr string
 		)
-		peak := measurePeakHeap(t, func() {
+		mem := measurePeakHeap(t, func() {
 			code, _, stderr = runCLI(t, "--in", in, "--out", out)
 		})
 		if code != ExitOK {
 			t.Fatalf("レコード %d MiB: 終了コード = %d, want %d (stderr=%q)", sizeMiB, code, ExitOK, stderr)
 		}
 
-		multiplier := float64(peak) / float64(recordBytes)
+		multiplier := float64(mem.Delta()) / float64(recordBytes)
 		breach := float64(memoryLimitBytes) / multiplier / (1 << 20)
-		t.Logf("レコード %d MiB → ヒープのピーク %s(倍率 %.1fx、上限 %s を破るのは約 %.0f MiB のレコードから)",
-			sizeMiB, mib(peak), multiplier, mib(memoryLimitBytes), breach)
+		t.Logf("レコード %d MiB → ヒープの増分 %s(ベースライン %s / ピーク %s、倍率 %.1fx、上限 %s を破るのは約 %.0f MiB のレコードから)",
+			sizeMiB, mib(mem.Delta()), mib(mem.Baseline), mib(mem.Peak), multiplier, mib(memoryLimitBytes), breach)
 
 		if multiplier > recordHeapMultiplierLimit {
 			t.Errorf("レコード %d MiB に対するヒープのピークの倍率が %.1fx で許容上限 %.1fx を超えた。"+
