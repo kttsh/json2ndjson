@@ -230,7 +230,7 @@ func openAppend(cfg *Config) (*OutputManager, error) {
 // どちらも非 Windows では一切症状が出ない。】
 //
 // 前提: Go の syscall.Open は Windows で次のようにアクセス権を組み立てる
-// (/usr/local/go1.25.1/src/syscall/syscall_windows.go:376-395)。
+// (go1.27.0 の src/syscall/syscall_windows.go:372-394。1.25.1 から変更なし)。
 //   - O_RDONLY→GENERIC_READ / O_WRONLY→GENERIC_WRITE / O_RDWR→両方
 //   - O_CREAT があれば GENERIC_WRITE を追加
 //   - O_APPEND があれば、O_TRUNC が無い限り GENERIC_WRITE を落とし

@@ -1,15 +1,15 @@
 // json2ndjson — DataSpider から呼び出される JSON → NDJSON 変換 CLI。
 //
-// 【go ディレクティブのバージョンについて(design.md からの意図的な逸脱)】
-// design.md「Technology Stack」は Go 1.27 系を go/toolchain ディレクティブで固定すると
-// 定めているが、本リポジトリのビルド環境では Go 1.27 のツールチェーンを取得できない
-// (組織のエグレス制限によりツールチェーンのダウンロードが遮断される)。
-// そのため go ディレクティブは「必要な最小バージョン」として 1.25.1 を宣言し、
-// toolchain ディレクティブは意図的に置かない(1.27 を強制するとビルド不能になるため)。
-//   - Go 1.27 以降でビルドする場合: jsonv2 が既定有効のため GOEXPERIMENT の設定は不要。
-//     この go.mod を変更せずそのままビルドできる(go ディレクティブは最小バージョンのため)。
-//   - Go 1.25.x でビルドする場合:  `GOEXPERIMENT=jsonv2` を設定した場合のみ
-//     `encoding/json/jsontext` を import できる。
+// 【go ディレクティブのバージョンについて】
+// design.md「Technology Stack」(IMPL-01)の定めどおり Go 1.27 系最新パッチに固定する
+// (2026-08-26 時点の最新は 1.27.0)。go ディレクティブがパッチまで含む完全な
+// バージョンであるため、GOTOOLCHAIN=auto の環境では 1.27.0 のツールチェーンが
+// 自動取得され、別途 toolchain ディレクティブを置く必要はない(同値の toolchain 行は
+// go mod tidy が削除するため意図的に置かない)。
+// Go 1.27 では jsonv2 が既定有効のため、`encoding/json/jsontext` の import に
+// GOEXPERIMENT の設定は不要。
+// (補足: 過去にツールチェーンのダウンロードが遮断される環境を理由に go 1.25.1 +
+// GOEXPERIMENT=jsonv2 で運用していたが、現環境では 1.27.0 の取得を実測確認済み。)
 //
 // 【サードパーティ依存について】
 // Windows のファイルロック(LockFileEx)用の golang.org/x/sys を唯一の依存とする(IMPL-02)。
@@ -19,6 +19,6 @@
 // これ以外のサードパーティモジュールは追加しない。
 module github.com/kttsh/json2ndjson
 
-go 1.25.1
+go 1.27.0
 
 require golang.org/x/sys v0.47.0
