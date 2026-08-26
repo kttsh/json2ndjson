@@ -75,7 +75,7 @@
   - _Depends: 2.1_
 
 - [ ] 5. 統合
-- [ ] 5.1 実行フローの結線と結果行出力
+- [x] 5.1 実行フローの結線と結果行出力
   - 引数解析 → 出力オープン → 変換 → カーソル抽出 → 確定 → 結果行出力を直列に結線し、失敗時は defer による中断処理で出力ファイルを開始前状態へ戻してから終了コードで終了する。panic は回復して終了コード 9 に変換する
   - 変換ループへの整形パイプラインの結線もここで確定する: records は重複排除・スキップ除外後の出力件数、last_id は最後に「出力した」レコードから抽出した値とする
   - 結果行(records・files・last_id)は正常確定後に 1 回だけ標準出力へ書き、書き込み前に ASCII 範囲を検証する。標準エラー出力は異常時のみ人間向け UTF-8 メッセージを書く
@@ -126,7 +126,8 @@
 - ~~**タスク 5.1 は `Pipeline.SetWarnWriter(stderr)` を必ず呼ぶこと**~~ — **タスク 2.3 の是正により解消済み。5.1 は `SetWarnWriter` を知る必要がない。** 変換の入口は `runConversion(cfg *Config, sink RecordSink, warn io.Writer)` の 1 本に統合され、内部で `newPipeline(cfg)` + `SetWarnWriter(warn)` を必ず行う。**タスク 5.1 は `runConversion(cfg, sink, stderr)` を呼ぶこと**(第 3 引数を省くとコンパイルエラーになるため、要件 6.6 の警告が無言で消えることはもう起こらない)。`warn` に nil を渡すと警告は抑止される(panic はしない)。なお 5.1 の完了条件には引き続き「`--max-record-bytes` + `--skip-oversize` で実際に stderr へ警告が出ること」の end-to-end 検証を含めること。
   - 注意: `warn` に**型付き nil**(例 `var w *bytes.Buffer` を `io.Writer` として渡す)を与え、かつ実際に超過レコードが存在すると `transform.go` の `fmt.Fprintf` で panic する。5.1 が渡すのは `os.Stderr`(非 nil 具象値)なので到達経路はない。
 - ~~**タスク 4.1 は `transform.go` の `dedupeMemoryNote` を `--help` 出力へ埋め込むこと**~~ — **タスク 4.1 で配線済み**(`version.go` の `usageText()` 末尾)。`TestUsageTextContainsDedupeMemoryNote` が固定し、埋め込みを外す変異でテストが落ちることをレビューが実測。`--dedupe-key` の位置が存在しないレコードを常に出力する旨もヘルプに記載済み(`TestUsageTextDocumentsDedupeMissingPosition`)。
-- **【重要・タスク 5.1 が必ず読むこと】`parseArgs` の番兵エラーを表示へ結線すること**(タスク 4.1)。`parseArgs` は `--version` / `--help` を表示も `os.Exit` もせずに `errShowVersion` / `errShowHelp` を返すだけで(IMPL-19/IMPL-20 に従い表示先と終了コードは main の責務)、**要件 7.5 / 7.6 の「表示して終了コード 0」は 5.1 が結線してはじめて満たされる**。5.1 は `errors.Is(err, errShowVersion)` → `versionLine()` を stdout へ、`errors.Is(err, errShowHelp)` → `usageText()` を stdout へ書き、いずれも終了コード 0 を返すこと(番兵は `*ExitError` ではないため、`errors.As(*ExitError)` の経路に載せると引数不正の 1 になる)。
+- ~~**【重要・タスク 5.1 が必ず読むこと】`parseArgs` の番兵エラーを表示へ結線すること**~~ — **タスク 5.1 で配線済み**。`run` は `errors.Is(err, errShowVersion)` → `versionLine()`、`errShowHelp` → `usageText()` を stdout へ書き、いずれも終了コード 0 を返す。判定は `*ExitError` への写像より**前**に置いてある。`TestRunVersionPrintsToStdout` / `TestRunHelpPrintsToStdout` が固定し、この分岐を丸ごと削る変異でテストが落ちることを実測。以下は原文:
+- 【原文】**`parseArgs` の番兵エラーを表示へ結線すること**(タスク 4.1)。`parseArgs` は `--version` / `--help` を表示も `os.Exit` もせずに `errShowVersion` / `errShowHelp` を返すだけで(IMPL-19/IMPL-20 に従い表示先と終了コードは main の責務)、**要件 7.5 / 7.6 の「表示して終了コード 0」は 5.1 が結線してはじめて満たされる**。5.1 は `errors.Is(err, errShowVersion)` → `versionLine()` を stdout へ、`errors.Is(err, errShowHelp)` → `usageText()` を stdout へ書き、いずれも終了コード 0 を返すこと(番兵は `*ExitError` ではないため、`errors.As(*ExitError)` の経路に載せると引数不正の 1 になる)。
   - **未配線でもコンパイル・`go vet`・`staticcheck`・`go test` のいずれも失敗しない**。`usageText()` は本番コードから 1 箇所も参照されておらず(参照は `cli_test.go` のみ)、Go は未使用関数をエラーにせず、テストが参照するため未使用検出にもかからない。レビューで実測確認済み。
   - 5.1 の完了条件に「`--version` / `--help` を渡した `run()` が stdout へ該当文言を書き、終了コード 0 を返すこと」の end-to-end テストを課すこと(現時点で `run()` を呼ぶテストは 1 本も存在しない)。
 - ~~**タスク 2.3 は `ConvertResult.LastValue` に `Apply` の戻り値をそのまま保持してはならない**~~ — **タスク 2.3 で対応済み**(`Clone()` した写しを保持し、写しを外す変異でテストが失敗することを確認)。
@@ -188,6 +189,23 @@
 - `--version` と `--help` の同時指定は `--version` を優先し、表示要求は他の検証(必須引数の欠落など)より先に判定する。ただし `--version --未知引数` は `flag.Parse` が先に失敗するため終了コード 1 になる(fail-closed)。
 - `--newline` の値は大文字小文字を区別する(`LF` は拒否)。要件 3.3 / 6.7 節の表記が `lf|crlf` のため。
 
+### タスク 5.1 が確定した main の契約
+
+- **フローは `run` → `executeConversion` の 2 段**。`run` が引数解析・表示要求・エラー報告・panic 回復・結果行の書き出しを持ち、`executeConversion` が出力ファイルのライフサイクルの内側(`openOutput` → `runConversion` → カーソル抽出 → 結果行の組み立て → `Finalize`)を持つ。
+- **結果行は `executeConversion` が組み立てて返し、`run` が確定後に書く**。書き出しを `Finalize` の後ろに置くための分割であり、`executeConversion` の中で書くと確定に失敗した実行が成功を示す結果行を返しうる(`TestRunFinalizeFailureReportsWithoutResultLine` が固定。出力先をディレクトリにして rename を確実に失敗させる)。
+- **順序の不変条件: カーソル抽出と結果行の組み立ては `Finalize` より前**。design.md「System Flows」のとおり、カーソル抽出の失敗(要件 5.5)に FR-39 のロールバックを自動適用するため。`Finalize` をカーソル抽出の前へ移す変異は `TestRunCursorFailureRollsBackAppend` が kill する。
+- **`defer out.Abort()` は `openOutput` 成功の直後に置く**。エラー経路と panic 経路の両方で復元を保証する唯一の手段であり、panic 回復(`run` の defer)より先に走る。`Finalize` 成功後の `Abort` は output 側の状態ガードで無効化される。
+- **panic の回復は `run` の defer**。終了コード 9 へ写像し、panic 値の概要のみを stderr へ書く(スタックトレースは出さない。要件 11.2 によりツールの観測点は終了コードと 1 行のメッセージに限る)。
+- **`reportError` は `*ExitError` の `Code` だけを終了コードの根拠とする**。`errors.As` で取れないエラーは正規化漏れとみなし 9。引数不正(1)のときだけ `--help` への参照を 1 行足す(stderr なので結果行の解析には影響しない)。
+- **結果行の ASCII 検証は 2 段**: 値単位の `validateResultValue`(空白も拒否)と行全体の `validateResultLine`(区切りの空白のみ許可)。行全体だけにすると空白入りの値が素通りし、値だけにすると `records`/`files` の書式変更を検査できない。終端 LF は検証の対象外。
+- **結果行の終端は常に LF**。`--newline crlf` は NDJSON ファイル側の改行であり結果行には影響しない(`TestRunResultLineIsLFTerminatedRegardlessOfNewlineOption` が固定)。
+- **`--version` / `--help` の書き込み失敗は無視し、結果行の書き込み失敗だけを検査する**(失敗時は終了コード 9)。前者は呼び出し元のループ制御の入力ではなく、要件 7.5 / 7.6 が定めるのは「表示して終了コード 0」であるため。非対称は意図的。
+- **`main_test.go` は panic 経路を本番シームなしで検証している**。`panicOnceWriter`(最初の `Write` だけ panic し以降は buf へ書く)を stderr / stdout として渡す。`--skip-oversize` の警告書き出しで panic させると「変換の途中で panic → `Abort` → 回復 → 9」の全経路を通せる。本番の `os.Stderr` は panic しないため、この経路のための防御コードは本番側に入れていない。
+
+### タスク 5.1 の design.md との乖離
+
+- **`formatResultLine` の署名**: design.md の main Service Interface は `formatResultLine(r *ConvertResult, cursor jsontext.Value) (string, error)` だが、実装は `formatResultLine(r *ConvertResult, cursor *string) (string, error)`。理由: カーソル値の非引用化と検証はタスク 2.2 が確定した `extractCursorValue` の契約であり、生の `jsontext.Value` を受けると同じ整形規則を main 側へ再実装することになる。`*string` の nil で「値なし」を表すことで、JSON の空文字列(`""`)を値に持つ場合と `--cursor-key` 未指定・0 件の場合を取り違えない。逸脱理由は `main.go` の doc コメントに恒久記録済み。**design を同期するかは人間の判断事項。**
+
 ### 未解決の所見(ブロッキングではない)
 
 - **`--out` が絶対パスであることは誰も検証していない**(タスク 4.1 レビューで実測: `--out relative/out.ndjson` は受理され `Config.Out` にそのまま入る)。design.md の output は Preconditions に「`cfg.Out` は絶対パス」を掲げるが、これを確立するコードは存在しない。要件違反ではない: 絶対パスで渡すのは呼び出し元の義務(`docs/requirements.md` の DS-11)であり、requirements.md の Boundary Context はこれを Adjacent expectations(スコープ外)に置いている。design.md の cli 検証リストにもタスク 4.1 の task text にも絶対パス検査は含まれない。**ただしタスク 3.2 / 5.1 は「cli が絶対パスを保証済み」と仮定してはならない。** 相対パスが渡ると作業ディレクトリ依存になり(NFR-13 と相反)、終了コード 0 のまま意図しない場所へ書き出す。
@@ -207,6 +225,7 @@
 - **design.md「File Structure Plan」が `lock.go` / `lock_test.go` を列挙していない**(タスク 3.1)。`_Boundary: lock_` は両ファイルを許可しているため逸脱ではないが、design.md 側が軽微に陳腐化している。
 
 - **`--max-record-bytes` 超過の終了コード 5 メッセージに位置情報がない**(タスク 2.2/2.3)。`--path` 由来の終了コード 5 はファイル名・バイトオフセット・JSON Pointer を持つが、サイズ超過由来のものは持たない(`convert.go` が `Apply` のエラーを装飾せず返すため)。要件 1.6 が位置情報を要求しているのは構文エラー(終了コード 3)であり要件違反ではないが、運用時の切り分けやすさとしてはタスク 5.1 で装飾を検討する価値がある。
+  - **タスク 5.1 は装飾を見送った**。位置情報(ファイル名・オフセット)を持つのは `fileContext` であり、装飾できるのは `convert.go` の `handleRecord` だけで main からは届かない。5.1 は main の結線タスクであって convert のエラー整形はその境界外のため、手を入れなかった。着手するなら convert 側の独立したタスクとして扱うこと。
 
 ### タスク 2.4 が常設したテスト資産
 
