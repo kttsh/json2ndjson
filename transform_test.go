@@ -779,7 +779,9 @@ func TestDedupeMemoryNote(t *testing.T) {
 	if dedupeMemoryNote == "" {
 		t.Fatal("dedupeMemoryNote が空です")
 	}
-	for _, want := range []string{"--dedupe-key", "256"} {
+	// 要件 9.4 / NFR-05 の主張そのものを拘束する。語の存在だけを見ていると、
+	// 注記を逆の意味(「上限の範囲で安全に動作する」等)へ書き換えても検出できない。
+	for _, want := range []string{"--dedupe-key", "256", "数百万", "超え"} {
 		if !strings.Contains(dedupeMemoryNote, want) {
 			t.Errorf("dedupeMemoryNote に %q が含まれていません: %s", want, dedupeMemoryNote)
 		}
