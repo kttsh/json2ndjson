@@ -43,7 +43,7 @@ json2ndjson --in page.json --out C:\data\out.ndjson --path /data/items
 | `--overwrite` | 既存の出力ファイルを上書きする(`--append` と排他) |
 | `--newline lf\|crlf` | 行の改行コード。既定は `lf` |
 | `--cursor-key <JSON Pointer>` | 最後に出力したレコードの指定位置の値を結果行の `last_id` に載せる |
-| `--dedupe-key <JSON Pointer>` | 指定位置の値が同一のレコードを同一実行内で 1 回だけ出力する |
+| `--dedupe-key <JSON Pointer>` | 指定位置の値が同一のレコードを同一実行内で 1 回だけ出力する。キー集合をメモリ上に保持するため、キー 1 件あたり約 110 バイト・約 250 万件でメモリ上限の目安 256 MB に達する(実測値。`perf_test.go` の PERF-05 で再計測可能) |
 | `--version` / `--help` | バージョン / 使い方を表示して終了する |
 
 このほかに整形用の引数(`--add-field`、`--key-hyphen-to-underscore`、`--max-record-bytes`、`--skip-oversize` など)がある。
