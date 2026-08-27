@@ -459,3 +459,195 @@ func TestPerfRecordHeapMultiplier(t *testing.T) {
 		}
 	}
 }
+
+// generateUniqueIDArray は id が全件異なるレコードを count 件並べた JSON 配列を
+// path へ書き出す。--dedupe-key のキー集合メモリの実測(PERF-05)に使うため、
+// 重複排除で 1 件も落ちない(= キー集合が最大まで育つ)入力を作る。
+func generateUniqueIDArray(t *testing.T, path string, count int) {
+	t.Helper()
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("入力ファイル %q を作成できません: %v", path, err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Fatalf("入力ファイル %q を閉じられません: %v", path, err)
+		}
+	}()
+
+	w := bufio.NewWriterSize(f, 1<<20)
+	var buf []byte
+	for i := range count {
+		buf = buf[:0]
+		if i > 0 {
+			buf = append(buf, ',')
+		} else {
+			buf = append(buf, '[')
+		}
+		buf = fmt.Appendf(buf, `{"id":%d,"v":"x"}`, i+1)
+		if _, err := w.Write(buf); err != nil {
+			t.Fatalf("入力ファイル %q へ書き出せません: %v", path, err)
+		}
+	}
+	if _, err := w.Write([]byte("]")); err != nil {
+		t.Fatalf("入力ファイル %q へ書き出せません: %v", path, err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("入力ファイル %q を書き切れません: %v", path, err)
+	}
+}
+
+// TestPerfDedupeKeySetMemory は --dedupe-key のキー集合が消費するメモリを
+// キー 100 万件と 500 万件で実測する(非機能テスト計画書 PERF-05、要件 9.4 / NFR-05)。
+//
+// NFR-05 が求めるのは上限の遵守ではなく文書化である。したがって実測値の報告が主目的で、
+// 合否条件は「キー件数に対するメモリの増加が線形の想定から大きく外れないこと」に留める。
+// 実測から「キー 1 件あたりのバイト数」と「何件で上限 256 MB に達するか」の目安を
+// 算出してログに出し、その値を運用文書(ヘルプの dedupeMemoryNote、README)の根拠とする。
+//
+// キー集合の増分だけを取り出すため、同じ入力を --dedupe-key なしで処理したときの
+// 増分をベースラインとして差し引く。
+func TestPerfDedupeKeySetMemory(t *testing.T) {
+	skipIfShort(t)
+
+	measure := func(count int, dedupe bool) uint64 {
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.json")
+		out := filepath.Join(dir, "out.ndjson")
+		generateUniqueIDArray(t, in, count)
+
+		args := []string{"--in", in, "--out", out}
+		if dedupe {
+			args = append(args, "--dedupe-key", "/id")
+		}
+		var (
+			code   int
+			stdout string
+			stderr string
+		)
+		mem := measurePeakHeap(t, func() {
+			code, stdout, stderr = runCLI(t, args...)
+		})
+		if code != ExitOK {
+			t.Fatalf("キー %d 件(dedupe=%v): 終了コード = %d, want %d (stderr=%q)",
+				count, dedupe, code, ExitOK, stderr)
+		}
+		if got := resultRecords(t, stdout); got != count {
+			t.Fatalf("キー %d 件(dedupe=%v): records = %d, want %d(全件一意のはず)",
+				count, dedupe, got, count)
+		}
+		return mem.Delta()
+	}
+
+	type sample struct {
+		count    int
+		keySet   uint64  // dedupe あり増分 − dedupe なし増分
+		perKey   float64 // キー 1 件あたりのバイト数
+		breachAt float64 // 上限 256 MB に達するキー件数の目安
+	}
+	var samples []sample
+	for _, count := range []int{1_000_000, 5_000_000} {
+		base := measure(count, false)
+		with := measure(count, true)
+		// GC のタイミング差で with < base になった場合は 0 として扱う(負の集合はない)。
+		var keySet uint64
+		if with > base {
+			keySet = with - base
+		}
+		perKey := float64(keySet) / float64(count)
+		var breachAt float64
+		if perKey > 0 {
+			breachAt = float64(memoryLimitBytes) / perKey
+		}
+		samples = append(samples, sample{count, keySet, perKey, breachAt})
+		t.Logf("キー %d 件: キー集合の増分 %s(ベース増分 %s / dedupe あり増分 %s、1 件あたり %.0f バイト、上限 %s に達するのは約 %.0f 万件)",
+			count, mib(keySet), mib(base), mib(with), perKey, mib(memoryLimitBytes), breachAt/10_000)
+	}
+
+	// 線形性の緩い検査: 件数 5 倍でキー集合が 2〜15 倍の範囲に収まること。
+	// map の実装(バケット倍化)により正確な 5 倍にはならないが、桁が合っていれば
+	// 「レコード数に比例して増える」という文書化(dedupeMemoryNote)の根拠になる。
+	small, large := samples[0], samples[1]
+	if small.keySet > 0 {
+		ratio := float64(large.keySet) / float64(small.keySet)
+		if ratio < 2 || ratio > 15 {
+			t.Errorf("キー件数 5 倍に対しキー集合が %.1f 倍。線形の想定(概ね 5 倍)から大きく外れている", ratio)
+		}
+	}
+	// 文書化の整合: ヘルプの注記が実測と矛盾しないことの最低限の確認。
+	// dedupeMemoryNote は「レコード数に比例」を謳っているため、存在だけを確かめる
+	// (文言の詳細は cli_test.go の TestUsageTextContainsDedupeMemoryNote が固定)。
+	if dedupeMemoryNote == "" {
+		t.Error("dedupeMemoryNote が空。NFR-05 の文書化義務を満たせない")
+	}
+}
+
+// TestPerfManyInputFiles は 3 MB × 100 ファイル(合計約 300 MB)の処理を計測する
+// (非機能テスト計画書 PERF-06、要件 9.3 / NFR-03、1.2 / FR-02)。
+//
+// 単一 300 MB との比較で確かめたいのは、メモリのピークがファイル数に比例しないこと。
+// 処理時間は報告のみとする(単一ファイルの TestPerf300MB と同じ方針)。
+func TestPerfManyInputFiles(t *testing.T) {
+	skipIfShort(t)
+
+	const (
+		fileCount  = 100
+		fileTarget = 3 << 20
+	)
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.ndjson")
+	args := []string{"--out", out}
+	var totalSize int64
+	var totalRecords int
+	genStart := time.Now()
+	for i := range fileCount {
+		// 整列(ベース名昇順)後も生成順と一致するよう、幅を固定した連番にする。
+		in := filepath.Join(dir, fmt.Sprintf("in-%03d.json", i))
+		size, records := generateArray(t, in, fileTarget, strings.Repeat("x", 128))
+		totalSize += size
+		totalRecords += records
+		args = append(args, "--in", in)
+	}
+	t.Logf("入力を生成: %d ファイル / 合計 %s / %d レコード(%v)",
+		fileCount, mib(uint64(totalSize)), totalRecords, time.Since(genStart).Round(time.Millisecond))
+
+	var (
+		code    int
+		stdout  string
+		stderr  string
+		elapsed time.Duration
+	)
+	mem := measurePeakHeap(t, func() {
+		start := time.Now()
+		code, stdout, stderr = runCLI(t, args...)
+		elapsed = time.Since(start)
+	})
+
+	if code != ExitOK {
+		t.Fatalf("終了コード = %d, want %d (stderr=%q)", code, ExitOK, stderr)
+	}
+	if got := resultRecords(t, stdout); got != totalRecords {
+		t.Errorf("records = %d, want %d", got, totalRecords)
+	}
+	if want := fmt.Sprintf("files=%d", fileCount); !strings.Contains(stdout, want) {
+		t.Errorf("結果行に %q がありません: %q", want, stdout)
+	}
+
+	throughput := float64(totalSize) / (1 << 20) / elapsed.Seconds()
+	t.Logf("処理時間: %v(%.1f MiB/s)", elapsed.Round(time.Millisecond), throughput)
+	t.Logf("ヒープのピーク: %s(合計入力 %s の %.1f%%)",
+		mib(mem.Peak), mib(uint64(totalSize)), 100*float64(mem.Peak)/float64(totalSize))
+
+	// メモリはファイル数にも合計サイズにも比例しない(要件 9.2 / NFR-02)。
+	// 判定は単一ファイルの TestPerf300MB と同じ絶対上限と、
+	// 「1 ファイル分(3 MB)の何倍か」ではなく合計の半分を超えないことで行う。
+	if mem.Peak > memoryLimitBytes {
+		t.Errorf("ヒープのピーク %s が上限 %s を超えた(要件 9.2 / NFR-02)", mib(mem.Peak), mib(memoryLimitBytes))
+	}
+	if half := uint64(totalSize) / 2; mem.Peak > half {
+		t.Errorf("ヒープのピーク %s が合計入力の半分 %s を超えた。ファイル単位で何かを蓄積している疑いがある(要件 9.1 / NFR-01)",
+			mib(mem.Peak), mib(half))
+	}
+}

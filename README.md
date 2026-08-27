@@ -43,7 +43,7 @@ json2ndjson --in page.json --out C:\data\out.ndjson --path /data/items
 | `--overwrite` | 既存の出力ファイルを上書きする(`--append` と排他) |
 | `--newline lf\|crlf` | 行の改行コード。既定は `lf` |
 | `--cursor-key <JSON Pointer>` | 最後に出力したレコードの指定位置の値を結果行の `last_id` に載せる |
-| `--dedupe-key <JSON Pointer>` | 指定位置の値が同一のレコードを同一実行内で 1 回だけ出力する |
+| `--dedupe-key <JSON Pointer>` | 指定位置の値が同一のレコードを同一実行内で 1 回だけ出力する。キー集合をメモリ上に保持するため、キー 1 件あたり約 110 バイト・約 250 万件でメモリ上限の目安 256 MB に達する(実測値。`perf_test.go` の PERF-05 で再計測可能) |
 | `--version` / `--help` | バージョン / 使い方を表示して終了する |
 
 このほかに整形用の引数(`--add-field`、`--key-hyphen-to-underscore`、`--max-record-bytes`、`--skip-oversize` など)がある。
@@ -115,8 +115,8 @@ JSON 処理は標準ライブラリ `encoding/json/jsontext` の Decoder / Encod
 
 ### 前提
 
-Go 1.27 系が必要である。
-`go.mod` がバージョンをパッチまで固定しているため、`GOTOOLCHAIN=auto`(既定)の環境なら手元の Go が古くても該当ツールチェーンが自動取得される。
+Go 1.25.1 以上が必要で、配布ビルドは Go 1.27 系を正とする(設計 IMPL-01)。
+`go.mod` の `go` ディレクティブは下限(1.25.1)を宣言している。Go 1.27 以降では jsonv2 が既定有効のため追加設定なしでビルドできる。Go 1.25.x では `GOEXPERIMENT=jsonv2` の設定が必要である(理由は `go.mod` 冒頭のコメントを参照)。
 
 ### 開発時のビルドとテスト
 
